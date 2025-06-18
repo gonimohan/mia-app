@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react" // Added useEffect
 import { TrendingUp, Calendar, Target, Zap, ArrowUp, ArrowDown, Minus, Download } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
@@ -8,111 +8,71 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from "recharts"
-import { useColorPalette } from "@/lib/color-context"
+// LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area removed from recharts
+// as charts are being removed or simplified to not use them.
+// import { useColorPalette } from "@/lib/color-context" // Removed as chartColors is no longer used
 
 interface Trend {
-  id: string
-  name: string
-  category: string
-  impact: "high" | "medium" | "low"
-  direction: "up" | "down" | "stable"
-  confidence: number
-  timeframe: "short" | "medium" | "long"
-  description: string
-  data: Array<{ month: string; value: number }>
+  id: string;
+  name: string;
+  category: string; // Will be defaulted or based on market_domain
+  impact: "high" | "medium" | "low";
+  direction: "up" | "down" | "stable"; // Default if not from API
+  confidence: number; // Default if not from API
+  timeframe: "short" | "medium" | "long";
+  description: string;
+  // data: Array<{ month: string; value: number }>; // Removed mini-chart data
 }
 
-const mockTrends: Trend[] = [
-  {
-    id: "1",
-    name: "AI Integration in Healthcare",
-    category: "Technology",
-    impact: "high",
-    direction: "up",
-    confidence: 92,
-    timeframe: "short",
-    description: "Rapid adoption of AI tools in medical diagnosis and treatment planning",
-    data: [
-      { month: "Jan", value: 45 },
-      { month: "Feb", value: 52 },
-      { month: "Mar", value: 61 },
-      { month: "Apr", value: 68 },
-      { month: "May", value: 75 },
-      { month: "Jun", value: 82 },
-    ],
-  },
-  {
-    id: "2",
-    name: "Sustainable Technology",
-    category: "Environment",
-    impact: "high",
-    direction: "up",
-    confidence: 78,
-    timeframe: "long",
-    description: "Growing focus on environmentally sustainable tech solutions",
-    data: [
-      { month: "Jan", value: 35 },
-      { month: "Feb", value: 38 },
-      { month: "Mar", value: 42 },
-      { month: "Apr", value: 45 },
-      { month: "May", value: 48 },
-      { month: "Jun", value: 52 },
-    ],
-  },
-  {
-    id: "3",
-    name: "Remote Work Tools",
-    category: "SaaS",
-    impact: "medium",
-    direction: "stable",
-    confidence: 85,
-    timeframe: "medium",
-    description: "Continued demand for collaboration and productivity tools",
-    data: [
-      { month: "Jan", value: 70 },
-      { month: "Feb", value: 72 },
-      { month: "Mar", value: 71 },
-      { month: "Apr", value: 73 },
-      { month: "May", value: 72 },
-      { month: "Jun", value: 74 },
-    ],
-  },
-  {
-    id: "4",
-    name: "Cryptocurrency Adoption",
-    category: "Finance",
-    impact: "medium",
-    direction: "down",
-    confidence: 65,
-    timeframe: "short",
-    description: "Declining interest in crypto investments amid market volatility",
-    data: [
-      { month: "Jan", value: 85 },
-      { month: "Feb", value: 78 },
-      { month: "Mar", value: 72 },
-      { month: "Apr", value: 65 },
-      { month: "May", value: 58 },
-      { month: "Jun", value: 52 },
-    ],
-  },
-]
-
-const overallTrendData = [
-  { month: "Jan", technology: 65, environment: 45, saas: 70, finance: 85 },
-  { month: "Feb", technology: 72, environment: 48, saas: 72, finance: 78 },
-  { month: "Mar", technology: 68, environment: 52, saas: 71, finance: 72 },
-  { month: "Apr", technology: 85, environment: 58, saas: 73, finance: 65 },
-  { month: "May", technology: 92, environment: 62, saas: 72, finance: 58 },
-  { month: "Jun", technology: 88, environment: 65, saas: 74, finance: 52 },
-]
+// mockTrends and overallTrendData removed
 
 export default function TrendsPage() {
-  const { getChartColors } = useColorPalette()
-  const chartColors = getChartColors()
-  const [trends, setTrends] = useState<Trend[]>(mockTrends)
+  // const { getChartColors } = useColorPalette() // Removed
+  // const chartColors = getChartColors() // Removed
+  const [trends, setTrends] = useState<Trend[]>([]) // Initialize with empty array
+  const [isLoading, setIsLoading] = useState<boolean>(true);
   const [selectedCategory, setSelectedCategory] = useState<string>("all")
   const [selectedTimeframe, setSelectedTimeframe] = useState<string>("all")
+
+  const fetchTrendsData = async () => {
+    setIsLoading(true);
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL || 'http://localhost:8000'}/trends`);
+      if (!response.ok) {
+        console.error(`Failed to fetch trends data: ${response.statusText}`);
+        setTrends([]);
+        return;
+      }
+      const responseData = await response.json();
+      const trendsListFromApi = responseData.data || [];
+
+      const transformedData: Trend[] = trendsListFromApi.map((item: any, index: number) => {
+        const impactMap = { high: "high", medium: "medium", low: "low" };
+        const timeframeMap = { "short-term": "short", "medium-term": "medium", "long-term": "long" };
+
+        return {
+          id: item.id || item.trend_name || `trend-${index}`,
+          name: item.trend_name || "Unknown Trend",
+          category: item.category || item.market_domain || "General", // Default category
+          impact: impactMap[item.estimated_impact?.toLowerCase() as keyof typeof impactMap] || "medium",
+          direction: item.direction || "stable", // Default direction
+          confidence: item.confidence_score || 75, // Default confidence
+          timeframe: timeframeMap[item.timeframe?.toLowerCase() as keyof typeof timeframeMap] || "medium",
+          description: item.description || item.supporting_evidence || "No description available.",
+        };
+      });
+      setTrends(transformedData);
+    } catch (error) {
+      console.error("Failed to fetch or transform trends data:", error);
+      setTrends([]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchTrendsData();
+  }, []);
 
   const filteredTrends = trends.filter((trend) => {
     const matchesCategory = selectedCategory === "all" || trend.category.toLowerCase() === selectedCategory
@@ -204,74 +164,10 @@ export default function TrendsPage() {
 
       {/* Main Content */}
       <div className="flex flex-1 flex-col gap-6 p-6">
-        {/* Overview Chart */}
-        <Card className="bg-dark-card border-dark-border">
-          <CardHeader>
-            <CardTitle className="text-white flex items-center gap-2">
-              <TrendingUp className="w-5 h-5 text-neon-pink" />
-              Trend Overview by Category
-            </CardTitle>
-            <CardDescription className="text-gray-400">
-              Monthly trend strength across different market categories
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={overallTrendData}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#404040" />
-                <XAxis dataKey="month" stroke="#9CA3AF" />
-                <YAxis stroke="#9CA3AF" />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "#2C2C2C",
-                    border: "1px solid #404040",
-                    borderRadius: "8px",
-                    color: "#fff",
-                  }}
-                />
-                <Area
-                  type="monotone"
-                  dataKey="technology"
-                  stackId="1"
-                  stroke={chartColors[0]}
-                  fill={chartColors[0]}
-                  fillOpacity={0.3}
-                  name="Technology"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="environment"
-                  stackId="1"
-                  stroke={chartColors[1]}
-                  fill={chartColors[1]}
-                  fillOpacity={0.3}
-                  name="Environment"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="saas"
-                  stackId="1"
-                  stroke={chartColors[2]}
-                  fill={chartColors[2]}
-                  fillOpacity={0.3}
-                  name="SaaS"
-                />
-                <Area
-                  type="monotone"
-                  dataKey="finance"
-                  stackId="1"
-                  stroke={chartColors[3]}
-                  fill={chartColors[3]}
-                  fillOpacity={0.3}
-                  name="Finance"
-                />
-              </AreaChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+        {/* Overview Chart - REMOVED */}
 
         {/* Trends Grid */}
-        <div className="grid gap-6 md:grid-cols-2">
+        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3"> {/* Adjusted for potentially more cards */}
           {filteredTrends.map((trend) => (
             <Card
               key={trend.id}
@@ -309,44 +205,9 @@ export default function TrendsPage() {
                   </div>
                 </div>
 
-                <div className="h-32">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={trend.data}>
-                      <XAxis
-                        dataKey="month"
-                        axisLine={false}
-                        tickLine={false}
-                        tick={{ fill: "#9CA3AF", fontSize: 10 }}
-                      />
-                      <YAxis hide />
-                      <Line
-                        type="monotone"
-                        dataKey="value"
-                        stroke={
-                          trend.direction === "up"
-                            ? chartColors[1]
-                            : trend.direction === "down"
-                              ? chartColors[2]
-                              : chartColors[0]
-                        }
-                        strokeWidth={2}
-                        dot={false}
-                        activeDot={{ r: 4, fill: "currentColor" }}
-                      />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: "#2C2C2C",
-                          border: "1px solid #404040",
-                          borderRadius: "4px",
-                          color: "#fff",
-                          fontSize: "12px",
-                        }}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
+                {/* Mini-chart removed from here */}
 
-                <div className="flex items-center justify-between pt-2 border-t border-dark-border">
+                <div className="flex items-center justify-between pt-4 mt-4 border-t border-dark-border">
                   <div className="flex items-center gap-2">
                     <Calendar className="w-4 h-4 text-gray-400" />
                     <span className="text-xs text-gray-400">
@@ -405,7 +266,7 @@ export default function TrendsPage() {
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-white">
-                    {Math.round(trends.reduce((acc, t) => acc + t.confidence, 0) / trends.length)}%
+                    {trends.length > 0 ? Math.round(trends.reduce((acc, t) => acc + t.confidence, 0) / trends.length) : 0}%
                   </p>
                   <p className="text-sm text-gray-400">Avg Confidence</p>
                 </div>

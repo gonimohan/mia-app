@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 import traceback
 import argparse
+from supabase import create_client, Client as SupabaseClient
 
 # Import required libraries with proper error handling
 try:
@@ -100,6 +101,30 @@ if "USER_AGENT" not in os.environ:
 load_dotenv()
 
 search_results_cache = TTLCache(maxsize=100, ttl=3600)
+
+# Global Supabase client variable or initialized on demand
+_supabase_client: Optional[SupabaseClient] = None
+
+def get_supabase_client() -> Optional[SupabaseClient]:
+    global _supabase_client
+    if _supabase_client:
+        return _supabase_client
+
+    supabase_url = os.getenv("SUPABASE_URL")
+    # Prefer service role key for backend operations if available and appropriate
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_ANON_KEY"))
+
+    if supabase_url and supabase_key:
+        try:
+            _supabase_client = create_client(supabase_url, supabase_key)
+            logger.info("Supabase client initialized successfully.")
+            return _supabase_client
+        except Exception as e:
+            error_logger.error(f"Failed to initialize Supabase client: {e}")
+            return None
+    else:
+        logger.warning("SUPABASE_URL or SUPABASE_KEY (ANON or SERVICE_ROLE) not found in environment variables.")
+        return None
 
 def get_api_key(service_name: str, user_id: Optional[str] = None) -> Optional[str]:
     logger.debug(f"Retrieving API key for service: {service_name}, UserID: {user_id if user_id else 'N/A'}")
@@ -1420,17 +1445,97 @@ class MarketIntelligenceAgent:
         if history is None:
             history = load_chat_history(session_id)
         return await chat_with_agent(message, session_id, history)
+
+    def _load_state_or_latest(self, state_id: Optional[str]) -> Optional[MarketIntelligenceState]:
+        if state_id:
+            logger.info(f"Agent: Loading specific state_id: {state_id}")
+            return load_state(state_id) # load_state is an existing function in agent_logic.py
+
+        logger.info("Agent: Attempting to load the latest state.")
+        db_path = get_db_path() # get_db_path is existing
+        conn = None
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            # Order by created_at DESC to get the latest state
+            cursor.execute("SELECT state_data FROM states ORDER BY DATETIME(created_at) DESC LIMIT 1")
+            row = cursor.fetchone()
+            if row:
+                logger.info("Agent: Latest state found in DB.")
+                state_data_json = row[0]
+                loaded_st = MarketIntelligenceState(**json.loads(state_data_json))
+                logger.info(f"Agent: Latest state loaded successfully (ID: {loaded_st.state_id}).")
+                return loaded_st
+            else:
+                logger.warning("Agent: No states found in the database to load as latest.")
+                return None
+        except sqlite3.Error as e:
+            error_logger.error(f"Agent: SQLite error while loading latest state: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            error_logger.error(f"Agent: JSON decode error while loading latest state: {e}")
+            return None
+        except Exception as e: # Catch any other unexpected errors
+            error_logger.error(f"Agent: Unexpected error loading latest state: {e}\n{traceback.format_exc()}")
+            return None
+        finally:
+            if conn:
+                conn.close()
     
     def get_state(self, state_id: str) -> Optional[MarketIntelligenceState]:
         """Get a saved state"""
-        return load_state(state_id)
+        return load_state(state_id) # Or self._load_state_or_latest(state_id) if we want this to also fetch latest by default
     
-    def get_customer_insights(self, state_id: str) -> List[Dict[str, Any]]:
-        """Get customer insights for a specific state"""
-        state = load_state(state_id)
-        if state:
+    def get_customer_insights(self, state_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get customer insights for a specific state or the latest state"""
+        logger.info(f"Agent: Getting customer insights for state_id: {state_id or 'latest'}")
+        state = self._load_state_or_latest(state_id)
+        if state and hasattr(state, 'customer_insights'):
             return state.customer_insights
+        logger.warning(f"Agent: No state or customer_insights found for get_customer_insights (state_id: {state_id or 'latest'})")
         return []
+
+    def get_competitors(self, state_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"Agent: Getting competitors for state_id: {state_id or 'latest'}")
+        state = self._load_state_or_latest(state_id)
+        if state and hasattr(state, 'competitor_data'):
+            return state.competitor_data
+        logger.warning(f"Agent: No state or competitor_data found for get_competitors (state_id: {state_id or 'latest'})")
+        return []
+
+    def get_trends(self, state_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        logger.info(f"Agent: Getting trends for state_id: {state_id or 'latest'}")
+        state = self._load_state_or_latest(state_id)
+        if state and hasattr(state, 'market_trends'):
+            return state.market_trends
+        logger.warning(f"Agent: No state or market_trends found for get_trends (state_id: {state_id or 'latest'})")
+        return []
+
+    def get_kpis(self, state_id: Optional[str] = None) -> Dict[str, Any]: # state_id is now unused but kept for API consistency
+        logger.info(f"Agent: Getting KPIs from Supabase (state_id: {state_id} will be ignored).")
+        supabase = get_supabase_client() # Use the helper
+        if not supabase:
+            logger.error("Agent: Supabase client not available for get_kpis.")
+            return {"source": "supabase", "error": "Supabase client not available", "data": []}
+
+        try:
+            # Fetch all KPI metrics, ordered by creation date
+            response = supabase.table("kpi_metrics").select("*").order("created_at", desc=True).limit(20).execute() # Fetch latest 20
+
+            if response.data:
+                logger.info(f"Agent: Successfully fetched {len(response.data)} KPI metrics from Supabase.")
+                return {"source": "supabase", "data": response.data}
+            else:
+                # Handle cases where response.error exists or data is empty
+                if hasattr(response, 'error') and response.error:
+                    logger.error(f"Agent: Error fetching KPIs from Supabase: {response.error}")
+                    return {"source": "supabase", "error": str(response.error), "data": []}
+                logger.info("Agent: No KPI metrics found in Supabase.")
+                return {"source": "supabase", "data": []}
+
+        except Exception as e:
+            error_logger.error(f"Agent: Exception while fetching KPIs from Supabase: {e}\n{traceback.format_exc()}")
+            return {"source": "supabase", "error": f"An exception occurred: {str(e)}", "data": []}
     
     def prepare_download(self, state_id: str, category: str) -> Optional[str]:
         """Prepare files for download"""

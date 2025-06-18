@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react" // Added useEffect
 import { Users, TrendingUp, Target, Heart, UserCheck, Download } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
@@ -24,51 +24,52 @@ interface CustomerSegment {
   lifetime_value: string
 }
 
-const mockCustomerInsights: CustomerSegment[] = [
-  {
-    segment_name: "Enterprise",
-    description: "Large organizations with complex needs and high-value contracts",
-    percentage: 35,
-    key_characteristics: ["High budget", "Long sales cycle", "Multiple stakeholders", "Complex requirements"],
-    pain_points: ["Integration complexity", "Security concerns", "Compliance requirements", "Change management"],
-    growth_potential: "Medium",
-    satisfaction_score: 7.8,
-    retention_rate: 85,
-    acquisition_cost: "High",
-    lifetime_value: "Very High",
-  },
-  {
-    segment_name: "SMB",
-    description: "Small and medium businesses seeking efficient solutions",
-    percentage: 45,
-    key_characteristics: ["Price sensitive", "Quick decision making", "Limited resources", "Growth focused"],
-    pain_points: ["Cost concerns", "Ease of implementation", "Limited technical expertise", "Time constraints"],
-    growth_potential: "High",
-    satisfaction_score: 8.2,
-    retention_rate: 75,
-    acquisition_cost: "Medium",
-    lifetime_value: "Medium",
-  },
-  {
-    segment_name: "Startups",
-    description: "Early stage companies with rapid growth potential",
-    percentage: 20,
-    key_characteristics: ["Innovation focused", "Limited budget", "Agile processes", "Tech-savvy"],
-    pain_points: ["Scalability", "Quick time-to-value", "Flexible pricing models", "Resource constraints"],
-    growth_potential: "Very High",
-    satisfaction_score: 8.5,
-    retention_rate: 65,
-    acquisition_cost: "Low",
-    lifetime_value: "Variable",
-  },
-]
+// const mockCustomerInsights: CustomerSegment[] = [ ... ] // This line and the mock data array are removed.
 
 export default function CustomerInsightsPage() {
   const { getChartColors } = useColorPalette()
   const chartColors = getChartColors()
-  const [insights, setInsights] = useState<CustomerSegment[]>(mockCustomerInsights)
-  const [loading, setLoading] = useState(false)
+  const [insights, setInsights] = useState<CustomerSegment[]>([]) // Initialize with empty array
+  const [loading, setLoading] = useState(true) // Start with loading true
 
+  const fetchCustomerInsightsData = async () => {
+    setLoading(true);
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL || 'http://localhost:8000'}/customer-insights`);
+      if (!response.ok) {
+        console.error(`Failed to fetch customer insights: ${response.statusText}`);
+        setInsights([]);
+        return;
+      }
+      const responseData = await response.json();
+      const rawData = responseData.data || [];
+
+      const transformedInsights: CustomerSegment[] = rawData.map((segment: any) => ({
+        segment_name: segment.segment_name || "Unnamed Segment",
+        description: segment.description || "No description.",
+        percentage: parseFloat(segment.percentage) || 0,
+        key_characteristics: Array.isArray(segment.key_characteristics) ? segment.key_characteristics : [],
+        pain_points: Array.isArray(segment.pain_points) ? segment.pain_points : [],
+        growth_potential: segment.growth_potential || "N/A",
+        satisfaction_score: parseFloat(segment.satisfaction_score) || 0,
+        retention_rate: parseFloat(segment.retention_rate) || 0,
+        acquisition_cost: segment.acquisition_cost || "N/A",
+        lifetime_value: segment.lifetime_value || "N/A",
+      }));
+      setInsights(transformedInsights);
+    } catch (error) {
+      console.error("Failed to fetch or transform customer insights:", error);
+      setInsights([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchCustomerInsightsData();
+  }, []);
+
+  // Derived data should be memoized or calculated after loading and insights are set
   const satisfactionData = insights.map((segment) => ({
     name: segment.segment_name,
     satisfaction: segment.satisfaction_score,
@@ -78,7 +79,7 @@ export default function CustomerInsightsPage() {
   const segmentDistribution = insights.map((segment, index) => ({
     name: segment.segment_name,
     value: segment.percentage,
-    color: chartColors[index % chartColors.length],
+    color: chartColors[index % chartColors.length], // Ensure chartColors is available
   }))
 
   const getGrowthPotentialColor = (potential: string) => {
@@ -113,6 +114,29 @@ export default function CustomerInsightsPage() {
     )
   }
 
+  if (loading) {
+    return (
+      <SidebarInset className="bg-dark-bg">
+        <div className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+            <div className="flex items-center gap-2">
+                <Users className="w-5 h-5 text-neon-purple" />
+                <h1 className="text-lg font-semibold text-white">Customer Insights</h1>
+            </div>
+        </div>
+        <div className="flex flex-1 items-center justify-center p-6">
+          <p className="text-white text-xl">Loading insights...</p>
+        </div>
+      </SidebarInset>
+    )
+  }
+
+  // Robust average calculation
+  const avgSatisfaction = insights.length > 0 ? (insights.reduce((acc, s) => acc + s.satisfaction_score, 0) / insights.length).toFixed(1) : "0.0";
+  const avgRetention = insights.length > 0 ? Math.round(insights.reduce((acc, s) => acc + s.retention_rate, 0) / insights.length) : 0;
+
+
   return (
     <SidebarInset className="bg-dark-bg">
       {/* Header */}
@@ -142,7 +166,7 @@ export default function CustomerInsightsPage() {
                   <Users className="w-6 h-6 text-neon-purple" />
                 </div>
                 <div>
-                  <p className="text-2xl font-bold text-white">{insights.length}</p>
+                  <p className="text-2xl font-bold text-white">{insights.length > 0 ? insights.length : "0"}</p>
                   <p className="text-sm text-gray-400">Customer Segments</p>
                 </div>
               </div>
@@ -157,7 +181,7 @@ export default function CustomerInsightsPage() {
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-white">
-                    {(insights.reduce((acc, s) => acc + s.satisfaction_score, 0) / insights.length).toFixed(1)}
+                    {avgSatisfaction}
                   </p>
                   <p className="text-sm text-gray-400">Avg Satisfaction</p>
                 </div>
@@ -173,7 +197,7 @@ export default function CustomerInsightsPage() {
                 </div>
                 <div>
                   <p className="text-2xl font-bold text-white">
-                    {Math.round(insights.reduce((acc, s) => acc + s.retention_rate, 0) / insights.length)}%
+                    {avgRetention}%
                   </p>
                   <p className="text-sm text-gray-400">Avg Retention</p>
                 </div>

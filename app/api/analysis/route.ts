@@ -11,15 +11,15 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "query_str and market_domain_str are required" }, { status: 400 })
     }
 
-    const response = await fetch(`${PYTHON_API_BASE_URL}/run-analysis`, {
+    const response = await fetch(`${PYTHON_API_BASE_URL}/analyze`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        query_str,
-        market_domain_str,
-        question_str,
+        query: query_str,
+        market_domain: market_domain_str,
+        question: question_str,
       }),
     })
 

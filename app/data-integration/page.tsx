@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react" // Added useEffect
 import {
   Database,
   Plus,
@@ -16,6 +16,7 @@ import {
   Newspaper,
   TrendingUp,
   Search,
+  Loader2, // For loading state
 } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
@@ -33,102 +34,203 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
+  // DialogTrigger, // Manual control for dialogs
+  DialogClose, // For cancel buttons
 } from "@/components/ui/dialog"
+import { useAuth } from "@/components/auth-provider" // For getting user token
+import { createClientComponentClient } from "@supabase/auth-helpers-nextjs" // For client-side Supabase
+import { useToast } from "@/hooks/use-toast" // For notifications
+
 
 import { APIKeyManager } from "@/components/api-key-manager"
 import { RealTimeSync } from "@/components/real-time-sync"
 
 interface DataSource {
-  id: string
-  name: string
-  type: string
-  status: "active" | "inactive" | "error"
-  lastSync: string
-  config: Record<string, any>
-  description?: string
-  category?: "news" | "financial" | "search" | "ai"
+  id: string;
+  name: string;
+  type: string;
+  status: "active" | "inactive" | "error" | string; // Allow string for flexibility from backend
+  last_sync?: string | null; // Made optional to match backend
+  config: Record<string, any>;
+  description?: string | null;
+  category?: "news" | "financial" | "search" | "ai" | string | null; // Allow string
+  user_id?: string; // From backend
+  created_at?: string;
+  updated_at?: string;
 }
 
-const mockDataSources: DataSource[] = [
-  {
-    id: "1",
-    name: "News API",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 10:30:00",
-    config: { endpoint: "https://newsapi.org/v2/", apiKey: "cb7855ef5b264ad2a6bbc558b68275cb" },
-  },
-  {
-    id: "2",
-    name: "MediaStack API",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 09:45:00",
-    config: { endpoint: "https://api.mediastack.com/v1/", apiKey: "0067073b9a277d60f5e8df841c6dbbb0" },
-  },
-  {
-    id: "3",
-    name: "GNews API",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 11:20:00",
-    config: { endpoint: "https://gnews.io/api/v4/", apiKey: "f41fcf180a70f8be38240a08dc917276" },
-  },
-  {
-    id: "4",
-    name: "Tavily Search API",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 08:30:00",
-    config: { endpoint: "https://api.tavily.com/", apiKey: "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" },
-  },
-  {
-    id: "5",
-    name: "SerpAPI",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 12:15:00",
-    config: { endpoint: "https://serpapi.com/", apiKey: "a2e37654962ee6a2396596ce8eccd0f6417cab97" },
-  },
-  {
-    id: "6",
-    name: "Alpha Vantage",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 07:45:00",
-    config: { endpoint: "https://www.alphavantage.co/", apiKey: "1Q65M3HC80UU6MSH" },
-  },
-  {
-    id: "7",
-    name: "Financial Modeling Prep",
-    type: "api",
-    status: "active",
-    lastSync: "2024-01-15 13:00:00",
-    config: { endpoint: "https://financialmodelingprep.com/api/", apiKey: "PhSpQuh9TvuJCkpfPb7ZyxJW4CsF7q8l" },
-  },
-  {
-    id: "8",
-    name: "Google Gemini AI",
-    type: "llm",
-    status: "active",
-    lastSync: "2024-01-15 14:30:00",
-    config: {
-      endpoint: "https://generativelanguage.googleapis.com/",
-      apiKey: "AIzaSyAhsAgSEFlsUz_mmIOCvfzhXdPXbuqiMdM",
-    },
-  },
-]
+// mockDataSources removed
 
 export default function DataIntegrationPage() {
-  const [dataSources, setDataSources] = useState<DataSource[]>(mockDataSources)
-  const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
-  const [newSource, setNewSource] = useState({
+  const { toast } = useToast();
+  const supabase = createClientComponentClient(); // Initialize Supabase client
+
+  const [dataSources, setDataSources] = useState<DataSource[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+
+  // State for Add/Edit Dialog
+  const [isModifyDialogOpen, setIsModifyDialogOpen] = useState(false);
+  const [editingSource, setEditingSource] = useState<DataSource | null>(null);
+  const [currentFormData, setCurrentFormData] = useState({
     name: "",
     type: "api",
+    description: "",
+    category: "",
+    // For config, we'll handle 'endpoint' and 'apiKey' as special cases for now
+    // based on the existing form, but ideally, config should be more flexible.
     endpoint: "",
     apiKey: "",
-  })
+    // Add other common config fields if necessary, or a general JSON input for config
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+
+  // State for Delete Dialog
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
+  const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
+
+
+  const getAuthToken = async () => {
+    const session = await supabase.auth.getSession();
+    return session.data.session?.access_token;
+  };
+
+  const fetchDataSources = async () => {
+    setIsLoading(true);
+    try {
+      const token = await getAuthToken();
+      if (!token) throw new Error("Authentication token not found.");
+
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) throw new Error(`Failed to fetch data sources: ${response.statusText}`);
+      const result = await response.json();
+      setDataSources(result as DataSource[]);
+    } catch (error: any) {
+      console.error(error);
+      toast({ title: "Error", description: error.message || "Could not fetch data sources.", variant: "destructive" });
+      setDataSources([]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchDataSources();
+  }, []);
+
+
+  const handleOpenAddDialog = () => {
+    setEditingSource(null);
+    setCurrentFormData({ name: "", type: "api", description: "", category: "", endpoint: "", apiKey: "" });
+    setIsModifyDialogOpen(true);
+  };
+
+  const handleOpenEditDialog = (source: DataSource) => {
+    setEditingSource(source);
+    setCurrentFormData({
+      name: source.name,
+      type: source.type,
+      description: source.description || "",
+      category: source.category || "",
+      endpoint: source.config?.endpoint || "",
+      apiKey: source.config?.apiKey || "",
+    });
+    setIsModifyDialogOpen(true);
+  };
+
+  const handleFormSubmit = async () => {
+    setIsSubmitting(true);
+    const token = await getAuthToken();
+    if (!token) {
+      toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+      setIsSubmitting(false);
+      return;
+    }
+
+    const payload: Partial<DataSource> & { config: Record<string, any> } = {
+      name: currentFormData.name,
+      type: currentFormData.type,
+      description: currentFormData.description || null,
+      category: currentFormData.category || null,
+      config: {
+        endpoint: currentFormData.endpoint,
+        // apiKey should ideally be handled more securely, e.g. never re-fetched to client
+        // For updates, if apiKey is not changed, don't send it or send a placeholder
+        // For this subtask, we'll send it if provided.
+        ...(currentFormData.apiKey && { apiKey: currentFormData.apiKey }),
+      },
+    };
+
+    // If it's an edit and API key is not re-entered, we might not want to overwrite it with an empty string.
+    // However, the backend PUT is designed for partial updates, so sending an empty apiKey if it was cleared is fine.
+    // Or, we can choose not to include apiKey in config if currentFormData.apiKey is empty.
+    // For now, if apiKey field is empty, it means user wants to clear/not set it if it's a new source.
+    // If editing, and apiKey is not touched, it's tricky without knowing original config structure well.
+    // The current setup implies apiKey is part of config.
+
+    const url = editingSource
+      ? `${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources/${editingSource.id}`
+      : `${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources`;
+    const method = editingSource ? "PUT" : "POST";
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.detail || "Failed to save data source.");
+
+      toast({ title: "Success", description: `Data source ${editingSource ? 'updated' : 'added'} successfully.` });
+      fetchDataSources(); // Refresh list
+      setIsModifyDialogOpen(false);
+    } catch (error: any) {
+      console.error(error);
+      toast({ title: "Error", description: error.message || "Could not save data source.", variant: "destructive" });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  const handleOpenDeleteDialog = (sourceId: string) => {
+    setDeletingSourceId(sourceId);
+    setIsDeleteDialogOpen(true);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deletingSourceId) return;
+    setIsSubmitting(true); // Use same submitting state for delete dialog
+    const token = await getAuthToken();
+    if (!token) {
+      toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+      setIsSubmitting(false);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources/${deletingSourceId}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => null); // Try to parse error
+        throw new Error(result?.detail || `Failed to delete data source. Status: ${response.status}`);
+      }
+      toast({ title: "Success", description: "Data source deleted successfully." });
+      fetchDataSources(); // Refresh list
+      setIsDeleteDialogOpen(false);
+      setDeletingSourceId(null);
+    } catch (error: any) {
+      console.error(error);
+      toast({ title: "Error", description: error.message || "Could not delete data source.", variant: "destructive" });
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -155,25 +257,9 @@ export default function DataIntegrationPage() {
     )
   }
 
-  const handleAddSource = () => {
-    const newDataSource: DataSource = {
-      id: Date.now().toString(),
-      name: newSource.name,
-      type: newSource.type,
-      status: "inactive",
-      lastSync: "Never",
-      config: {
-        endpoint: newSource.endpoint,
-        apiKey: newSource.apiKey,
-      },
-    }
+  // handleAddSource is replaced by handleFormSubmit
 
-    setDataSources([...dataSources, newDataSource])
-    setNewSource({ name: "", type: "api", endpoint: "", apiKey: "" })
-    setIsAddDialogOpen(false)
-  }
-
-  const getSourceIcon = (type: string, category?: string) => {
+  const getSourceIcon = (type: string, category?: string | null) => { // category can be null
     if (type === "llm") return <Zap className="w-5 h-5 text-neon-purple" />
     if (category === "news") return <Newspaper className="w-5 h-5 text-neon-blue" />
     if (category === "financial") return <TrendingUp className="w-5 h-5 text-neon-green" />
@@ -192,89 +278,26 @@ export default function DataIntegrationPage() {
           <h1 className="text-lg font-semibold text-white">Data Integration</h1>
         </div>
         <div className="ml-auto">
-          <Dialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen}>
-            <DialogTrigger asChild>
-              <Button className="bg-neon-green/20 border border-neon-green/50 text-neon-green hover:bg-neon-green/30 hover:shadow-neon-green/50 hover:shadow-lg transition-all duration-300">
-                <Plus className="w-4 h-4 mr-2" />
-                Add New Data Source
-              </Button>
-            </DialogTrigger>
-            <DialogContent className="bg-dark-card border-dark-border text-white">
-              <DialogHeader>
-                <DialogTitle className="text-neon-green">Add New Data Source</DialogTitle>
-                <DialogDescription className="text-gray-400">
-                  Configure a new data source for market intelligence gathering.
-                </DialogDescription>
-              </DialogHeader>
-              <div className="grid gap-4 py-4">
-                <div className="grid gap-2">
-                  <Label htmlFor="name" className="text-white">
-                    Name
-                  </Label>
-                  <Input
-                    id="name"
-                    value={newSource.name}
-                    onChange={(e) => setNewSource({ ...newSource, name: e.target.value })}
-                    className="bg-dark-bg border-dark-border text-white"
-                    placeholder="Enter data source name"
-                  />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="type" className="text-white">
-                    Type
-                  </Label>
-                  <Select value={newSource.type} onValueChange={(value) => setNewSource({ ...newSource, type: value })}>
-                    <SelectTrigger className="bg-dark-bg border-dark-border text-white">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-dark-card border-dark-border">
-                      <SelectItem value="api">API</SelectItem>
-                      <SelectItem value="database">Database</SelectItem>
-                      <SelectItem value="file">File Upload</SelectItem>
-                    </SelectContent>
-                  </Select>
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="endpoint" className="text-white">
-                    Endpoint URL
-                  </Label>
-                  <Input
-                    id="endpoint"
-                    value={newSource.endpoint}
-                    onChange={(e) => setNewSource({ ...newSource, endpoint: e.target.value })}
-                    className="bg-dark-bg border-dark-border text-white"
-                    placeholder="https://api.example.com/"
-                  />
-                </div>
-                <div className="grid gap-2">
-                  <Label htmlFor="apiKey" className="text-white">
-                    API Key
-                  </Label>
-                  <Input
-                    id="apiKey"
-                    type="password"
-                    value={newSource.apiKey}
-                    onChange={(e) => setNewSource({ ...newSource, apiKey: e.target.value })}
-                    className="bg-dark-bg border-dark-border text-white"
-                    placeholder="Enter API key"
-                  />
-                </div>
-              </div>
-              <DialogFooter>
-                <Button
-                  onClick={handleAddSource}
-                  className="bg-neon-green/20 border border-neon-green/50 text-neon-green hover:bg-neon-green/30"
-                >
-                  Add Data Source
-                </Button>
-              </DialogFooter>
-            </DialogContent>
-          </Dialog>
+          {/* Add New Data Source Button - Triggers Dialog */}
+          <Button
+            onClick={handleOpenAddDialog}
+            className="bg-neon-green/20 border border-neon-green/50 text-neon-green hover:bg-neon-green/30 hover:shadow-neon-green/50 hover:shadow-lg transition-all duration-300"
+          >
+            <Plus className="w-4 h-4 mr-2" />
+            Add New Data Source
+          </Button>
         </div>
       </header>
 
       {/* Main Content */}
       <div className="flex flex-1 flex-col gap-6 p-6">
+        {isLoading && (
+          <div className="flex justify-center items-center py-10">
+            <Loader2 className="w-8 h-8 text-neon-blue animate-spin" />
+            <p className="ml-2 text-white">Loading data sources...</p>
+          </div>
+        )}
+        {!isLoading && (
         <Tabs defaultValue="sources" className="w-full">
           <TabsList className="grid w-full grid-cols-4 bg-dark-card border border-dark-border">
             <TabsTrigger
@@ -331,13 +354,14 @@ export default function DataIntegrationPage() {
                       </div>
                       <div className="flex items-center gap-2">
                         {getStatusBadge(source.status)}
-                        <Button variant="ghost" size="icon" className="text-gray-400 hover:text-white hover:bg-dark-bg">
+                        <Button variant="ghost" size="icon" className="text-gray-400 hover:text-white hover:bg-dark-bg" onClick={() => handleOpenEditDialog(source)}>
                           <Edit className="w-4 h-4" />
                         </Button>
                         <Button
                           variant="ghost"
                           size="icon"
                           className="text-gray-400 hover:text-neon-pink hover:bg-neon-pink/10"
+                          onClick={() => handleOpenDeleteDialog(source.id)}
                         >
                           <Trash2 className="w-4 h-4" />
                         </Button>
@@ -345,13 +369,16 @@ export default function DataIntegrationPage() {
                     </div>
                   </CardHeader>
                   <CardContent>
+                    <div className="text-sm text-gray-400 mb-2">{source.description || "No description."}</div>
+                    <div className="text-xs text-gray-500 mb-2">Category: {source.category || "N/A"}</div>
+                     <div className="text-xs text-gray-500 mb-4 break-all">Config: {JSON.stringify(source.config)}</div>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-4 text-sm text-gray-400">
                         <div className="flex items-center gap-1">
                           {getStatusIcon(source.status)}
                           <span>Status: {source.status}</span>
                         </div>
-                        <div>Last Sync: {source.lastSync}</div>
+                        <div>Last Sync: {source.last_sync ? new Date(source.last_sync).toLocaleString() : "Never"}</div>
                       </div>
                       <div className="flex gap-2">
                         <Button
@@ -448,7 +475,97 @@ export default function DataIntegrationPage() {
             </Card>
           </TabsContent>
         </Tabs>
+        )} {/* End of !isLoading condition */}
       </div>
+
+      {/* Add/Edit Dialog */}
+      <Dialog open={isModifyDialogOpen} onOpenChange={setIsModifyDialogOpen}>
+        <DialogContent className="bg-dark-card border-dark-border text-white">
+          <DialogHeader>
+            <DialogTitle className="text-neon-green">
+              {editingSource ? "Edit Data Source" : "Add New Data Source"}
+            </DialogTitle>
+            <DialogDescription className="text-gray-400">
+              {editingSource ? "Update the details of your data source." : "Configure a new data source."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            <div className="grid gap-2">
+              <Label htmlFor="sourceName">Name</Label>
+              <Input id="sourceName" value={currentFormData.name} onChange={(e) => setCurrentFormData({...currentFormData, name: e.target.value})} className="bg-dark-bg border-dark-border" />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="sourceType">Type</Label>
+              <Select value={currentFormData.type} onValueChange={(value) => setCurrentFormData({...currentFormData, type: value })}>
+                <SelectTrigger className="bg-dark-bg border-dark-border"><SelectValue /></SelectTrigger>
+                <SelectContent className="bg-dark-card border-dark-border">
+                  <SelectItem value="api">API</SelectItem>
+                  <SelectItem value="rss">RSS Feed</SelectItem>
+                  <SelectItem value="website_scrape">Website Scrape</SelectItem>
+                  <SelectItem value="file_upload">File Upload</SelectItem>
+                  <SelectItem value="database">Database</SelectItem>
+                  <SelectItem value="llm">LLM Provider</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="sourceDescription">Description</Label>
+              <Input id="sourceDescription" value={currentFormData.description} onChange={(e) => setCurrentFormData({...currentFormData, description: e.target.value})} className="bg-dark-bg border-dark-border" />
+            </div>
+             <div className="grid gap-2">
+              <Label htmlFor="sourceCategory">Category</Label>
+              <Select value={currentFormData.category} onValueChange={(value) => setCurrentFormData({...currentFormData, category: value })}>
+                <SelectTrigger className="bg-dark-bg border-dark-border"><SelectValue placeholder="Select a category" /></SelectTrigger>
+                <SelectContent className="bg-dark-card border-dark-border">
+                  <SelectItem value="news">News</SelectItem>
+                  <SelectItem value="financial">Financial</SelectItem>
+                  <SelectItem value="search">Search/Crawling</SelectItem>
+                  <SelectItem value="social_media">Social Media</SelectItem>
+                  <SelectItem value="competitor_intel">Competitor Intel</SelectItem>
+                  <SelectItem value="industry_reports">Industry Reports</SelectItem>
+                  <SelectItem value="custom">Custom</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="sourceEndpoint">Config: Endpoint URL</Label>
+              <Input id="sourceEndpoint" value={currentFormData.endpoint} onChange={(e) => setCurrentFormData({...currentFormData, endpoint: e.target.value})} className="bg-dark-bg border-dark-border" placeholder="e.g., https://api.example.com/v1" />
+            </div>
+            <div className="grid gap-2">
+              <Label htmlFor="sourceApiKey">Config: API Key (optional)</Label>
+              <Input id="sourceApiKey" type="password" value={currentFormData.apiKey} onChange={(e) => setCurrentFormData({...currentFormData, apiKey: e.target.value})} className="bg-dark-bg border-dark-border" />
+            </div>
+            {/* TODO: Add more fields for a flexible config object if needed, or a JSON editor */}
+          </div>
+          <DialogFooter>
+            <DialogClose asChild><Button variant="outline" className="border-gray-600 text-gray-300 hover:bg-dark-bg">Cancel</Button></DialogClose>
+            <Button onClick={handleFormSubmit} disabled={isSubmitting} className="bg-neon-green/80 hover:bg-neon-green/70 text-white">
+              {isSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              {editingSource ? "Save Changes" : "Add Source"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete Confirmation Dialog */}
+      <Dialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}>
+        <DialogContent className="bg-dark-card border-dark-border text-white sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-neon-pink">Confirm Deletion</DialogTitle>
+            <DialogDescription>
+              Are you sure you want to delete this data source? This action cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild><Button variant="outline" className="border-gray-600 text-gray-300 hover:bg-dark-bg">Cancel</Button></DialogClose>
+            <Button onClick={handleConfirmDelete} disabled={isSubmitting} variant="destructive" className="bg-neon-pink hover:bg-neon-pink/80">
+              {isSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
     </SidebarInset>
   )
 }
