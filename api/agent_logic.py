@@ -5,7 +5,7 @@ import sqlite3
 import logging
 import shutil
 import re
-from datetime import datetime
+from datetime import datetime, timezone # Ensure timezone is imported
 from typing import Dict, List, Any, Optional
 from uuid import uuid4
 from dotenv import load_dotenv
@@ -25,10 +25,11 @@ try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain.chains import RetrievalQA
-    from supabase import create_client, Client as SupabaseClient # Added Supabase import
+    from supabase import create_client, Client as SupabaseClient
+    from langchain_google_genai import ChatGoogleGenerativeAI # Added for direct LLM instantiation
 except ImportError as e:
     print(f"Error importing LangChain libraries: {e}")
-    print("Please install required packages: pip install langchain langchain_core langgraph langchain_community supabase") # Added supabase to pip install message
+    print("Please install required packages: pip install langchain langchain_core langgraph langchain_community supabase langchain-google-genai") # Added supabase & langchain-google-genai to pip install message
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -103,56 +104,144 @@ load_dotenv()
 search_results_cache = TTLCache(maxsize=100, ttl=3600)
 
 # Global Supabase client instance
+# This line must be at module level, outside any function or class
 _supabase_client_instance: Optional[SupabaseClient] = None
 
-def get_supabase_client() -> Optional[SupabaseClient]:
+def get_supabase_client() -> Optional[SupabaseClient]: # This function must be at module level
     global _supabase_client_instance
     if _supabase_client_instance:
         return _supabase_client_instance
 
+    # Try to get URL consistently, checking common environment variable names
     supabase_url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
-    # Prioritize SERVICE_ROLE_KEY, fall back to ANON_KEY for flexibility (e.g. client-side use)
+    # Prioritize SERVICE_ROLE_KEY for backend operations
     supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 
     if not supabase_key:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY not found for agent_logic, falling back to SUPABASE_ANON_KEY.")
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not found for agent_logic's Supabase client, attempting fallback to SUPABASE_ANON_KEY.")
         supabase_key = os.getenv("SUPABASE_ANON_KEY")
 
     if supabase_url and supabase_key:
         try:
-            # Log only a part of the URL that is not sensitive, e.g., the project ID part if present
-            # Example: "https://[project-id].supabase.co" -> log "project-id"
-            url_parts = supabase_url.split('//')
-            domain_part = url_parts[-1].split('.')[0] if len(url_parts) > 1 else "unknown_domain"
-            logger.info(f"Initializing Supabase client for agent_logic with URL domain: {domain_part}...")
+            # Mask part of the URL in logs for security
+            url_domain_part = "URL_NOT_LOGGED"
+            if '//' in supabase_url:
+                url_domain_part = supabase_url.split('//')[-1].split('.')[0]
+
+            logger.info(f"Initializing Supabase client for agent_logic with URL domain: {url_domain_part}...")
+
+            # This is where 'SupabaseClient' and 'create_client' must be defined/imported
+            # If 'SupabaseClient' is None due to import error, this will fail here.
+            if 'SupabaseClient' not in globals() or globals()['SupabaseClient'] is None:
+                error_logger.error("SupabaseClient type is not available due to import error. Cannot initialize client.")
+                return None
+
             _supabase_client_instance = create_client(supabase_url, supabase_key)
             logger.info("Supabase client for agent_logic initialized successfully.")
             return _supabase_client_instance
         except Exception as e:
             error_logger.error(f"Failed to initialize Supabase client in agent_logic: {e}\n{traceback.format_exc()}")
-            _supabase_client_instance = None
+            _supabase_client_instance = None # Reset on failure
             return None
     else:
-        error_logger.error("SUPABASE_URL or a SUPABASE_KEY (SERVICE_ROLE or ANON) not found in environment for agent_logic.")
-        _supabase_client_instance = None
+        error_logger.error("CRITICAL: SUPABASE_URL or a SUPABASE_KEY (SERVICE_ROLE or ANON) not found in environment for agent_logic's Supabase client.")
+        _supabase_client_instance = None # Reset on failure
         return None
 
 def get_api_key(service_name: str, user_id: Optional[str] = None) -> Optional[str]:
-    logger.debug(f"Retrieving API key for service: {service_name}, UserID: {user_id if user_id else 'N/A'}")
-    env_var_map = {
-        "TAVILY": "TAVILY_API_KEY",
-        "SERPAPI": "SERPAPI_API_KEY",
-        "NEWS_API": "NEWS_API_KEY",
-        "FINANCIAL_MODELING_PREP": "FINANCIAL_MODELING_PREP_API_KEY",
-        "ALPHA_VANTAGE": "ALPHA_VANTAGE_API_KEY",
-        "MEDIASTACK": "MEDIASTACK_API_KEY"
+    logger.debug(f"Attempting to retrieve API key for service: {service_name}, UserID: {user_id or 'N/A'}")
+
+    normalized_service_name = service_name.lower().replace("_", "").replace("api", "").replace("search", "").strip()
+    # Example normalizations: "NEWS_API" -> "news", "GOOGLE_GEMINI" -> "googlegemini", "TAVILY" -> "tavily"
+
+    if user_id:
+        supabase = get_supabase_client()
+        if supabase:
+            try:
+                # Fetch active data sources for the user
+                # The table name is 'data_sources'
+                # We need to match 'service_name' against 'name' or 'type' columns
+                response = supabase.table("data_sources").select("name, type, config, status").eq("user_id", user_id).eq("status", "active").execute()
+
+                if response.data:
+                    for source in response.data:
+                        source_name_lower = (source.get('name') or "").lower().replace(" ", "")
+                        source_type_lower = (source.get('type') or "").lower().replace(" ", "")
+
+                        # More flexible matching:
+                        # e.g., if service_name is "NEWS_API", normalized is "news"
+                        # it could match source_type_lower "news" or "newsapi"
+                        # or source_name_lower "newsapi" or "my news api"
+
+                        # Check if normalized_service_name is part of the source's name or type
+                        # This is a heuristic, might need refinement based on how data_sources are named/typed by users
+                        match_found = False
+                        if normalized_service_name in source_name_lower:
+                            match_found = True
+                        elif normalized_service_name in source_type_lower:
+                            match_found = True
+                        # Specific check for "google_gemini" or "gemini" to match "google" or "gemini" or "ai" type/name
+                        elif normalized_service_name in ["gemini", "googlegemini"] and \
+                             any(term in source_type_lower for term in ["google", "gemini", "ai"]) or \
+                             any(term in source_name_lower for term in ["google", "gemini", "ai"]):
+                            match_found = True
+
+
+                        if match_found:
+                            config = source.get('config')
+                            if config and isinstance(config, dict): # Config is expected to be JSONB, parsed as dict
+                                api_key_from_db = config.get("apiKey") or config.get("api_key") # Check common variations
+                                if api_key_from_db and isinstance(api_key_from_db, str) and api_key_from_db.strip():
+                                    logger.info(f"Using API key from database for service: {service_name} (User: {user_id}, Source Name: {source.get('name')})")
+                                    return api_key_from_db.strip()
+                                else:
+                                    logger.warning(f"Database source '{source.get('name')}' found for {service_name} (User: {user_id}) but 'apiKey' or 'api_key' missing, invalid, or empty in config: {config}")
+                            else:
+                                logger.warning(f"Database source '{source.get('name')}' found for {service_name} (User: {user_id}) but 'config' field is missing or not a dictionary: {config}")
+
+                logger.info(f"No user-specific active API key found in database for service: {service_name} (UserID: {user_id}). Falling back to environment variables.")
+            except Exception as e:
+                error_logger.error(f"Error querying database for API key (service: {service_name}, user: {user_id}): {e}\n{traceback.format_exc()}")
+        else:
+            logger.warning("Supabase client not available for DB API key lookup. Falling back to environment variables.")
+
+    # Fallback to environment variables
+    # Standardized keys used by the agent internally vs. actual env var names
+    internal_to_env_map = {
+        "tavily": "TAVILY_API_KEY",
+        "serpapi": "SERPAPI_API_KEY",
+        "news_api": "NEWS_API_KEY", # Used by fetch_from_newsapi_direct
+        "newsapi": "NEWS_API_KEY",   # Alias for flexibility
+        "financial_modeling_prep": "FINANCIAL_MODELING_PREP_API_KEY",
+        "alpha_vantage": "ALPHA_VANTAGE_API_KEY",
+        "mediastack": "MEDIASTACK_API_KEY",
+        "google_gemini": os.getenv("GOOGLE_API_KEY_NAME", "GOOGLE_API_KEY"), # For LLMs
+        "gemini": os.getenv("GOOGLE_API_KEY_NAME", "GOOGLE_API_KEY"), # Alias
+        "google_genai": os.getenv("GOOGLE_API_KEY_NAME", "GOOGLE_API_KEY") # Alias
     }
-    env_var_name = env_var_map.get(service_name.upper(), f"{service_name.upper()}_API_KEY")
-    api_key = os.getenv(env_var_name)
-    if api_key:
-        logger.info(f"API key found for service: {service_name}")
-        return api_key
-    logger.warning(f"API key not found for service: {service_name} (looked for {env_var_name})")
+
+    # Try direct match with service_name or normalized_service_name in map
+    env_var_name = internal_to_env_map.get(service_name.upper()) \
+                   or internal_to_env_map.get(normalized_service_name) \
+                   or internal_to_env_map.get(service_name.lower())
+
+
+    if not env_var_name: # If not in map, construct it (e.g. SOME_OTHER_SERVICE -> SOME_OTHER_SERVICE_API_KEY)
+        env_var_name = f"{service_name.upper()}_API_KEY"
+
+    api_key_from_env = os.getenv(env_var_name)
+    if api_key_from_env and api_key_from_env.strip():
+        logger.info(f"Using API key from environment variable {env_var_name} for service: {service_name}")
+        return api_key_from_env.strip()
+
+    # Final check for GOOGLE_API_KEY if specific names failed for Gemini variants
+    if normalized_service_name in ["gemini", "googlegemini", "google_genai"] and not api_key_from_env:
+        api_key_from_env = os.getenv("GOOGLE_API_KEY")
+        if api_key_from_env and api_key_from_env.strip():
+            logger.info(f"Using API key from fallback GOOGLE_API_KEY for service: {service_name}")
+            return api_key_from_env.strip()
+
+    logger.warning(f"API key not found for service: {service_name} (UserID: {user_id or 'N/A'}, EnvVar tried: {env_var_name})")
     return None
 
 def init_db():
@@ -230,6 +319,7 @@ class MarketIntelligenceState(BaseModel):
     customer_insights: List[Dict[str, Any]] = Field(default_factory=list)
     market_domain: str = "General Technology"
     query: Optional[str] = None
+    user_id: Optional[str] = None  # ADDED/ENSURED THIS LINE
     question: Optional[str] = None
     query_response: Optional[str] = None
     report_template: Optional[str] = None
@@ -267,28 +357,39 @@ def get_db_path():
         return os.path.join(api_python_dir, db_name)
 
 def save_state(state_obj: MarketIntelligenceState):
-    db_path = get_db_path()
+    db_path = get_db_path() # Assumes get_db_path() is available
+    conn = None # Initialize conn to None for robust finally block
     try:
         conn = sqlite3.connect(db_path)
         cursor_obj = conn.cursor()
-        # Ensure state_obj.user_id is correctly passed and saved
-        logger.debug(f"Saving state for UserID: {state_obj.user_id}, StateID: {state_obj.state_id}")
+
+        # Ensure created_at uses timezone.utc.isoformat()
+        created_at_iso = datetime.now(timezone.utc).isoformat()
+
+        logger.debug(f"Saving state for UserID: {state_obj.user_id}, StateID: {state_obj.state_id}, CreatedAt: {created_at_iso}")
+
+        # The 'states' table schema is (id, user_id, market_domain, query, state_data, created_at)
+        # Ensure correct order and inclusion of user_id.
         cursor_obj.execute(
             'INSERT OR REPLACE INTO states (id, user_id, market_domain, query, state_data, created_at) VALUES (?, ?, ?, ?, ?, ?)',
             (
                 state_obj.state_id,
-                state_obj.user_id, # Save user_id
+                state_obj.user_id,  # This is the crucial addition/correction
                 state_obj.market_domain,
                 state_obj.query,
-                state_obj.model_dump_json(),
-                datetime.now(timezone.utc).isoformat() # Use timezone aware ISO8601 string
+                state_obj.model_dump_json(), # Ensure this is used for serialization
+                created_at_iso
             )
         )
         conn.commit()
-        conn.close()
         logger.info(f"State saved: ID={state_obj.state_id}, UserID={state_obj.user_id}, Domain='{state_obj.market_domain}' to {db_path}")
-    except Exception as e_save_state:
-        error_logger.error(f"Failed to save state {state_obj.state_id} for UserID {state_obj.user_id} to {db_path}: {e_save_state}")
+    except sqlite3.Error as e_save_sqlite: # More specific exception
+        error_logger.error(f"SQLite error saving state {state_obj.state_id} for UserID {state_obj.user_id} to {db_path}: {e_save_sqlite}\n{traceback.format_exc()}")
+    except Exception as e_save_state: # Catch other errors like Pydantic issues
+        error_logger.error(f"Unexpected error saving state {state_obj.state_id} for UserID {state_obj.user_id} to {db_path}: {e_save_state}\n{traceback.format_exc()}")
+    finally:
+        if conn:
+            conn.close()
 
 def list_user_analysis_states(user_id: str) -> List[Dict[str, Any]]:
     db_path = get_db_path()
@@ -697,19 +798,26 @@ def get_download_file_path(state_id: str, user_id: str, file_identifier: str) ->
             conn.close()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
-def search_with_tavily(search_query: str) -> List[str]:
-    normalized_cache_key = f"tavily_search_{search_query.lower().replace(' ', '_')}"
+def search_with_tavily(search_query: str, user_id: Optional[str] = None) -> List[str]: # Add user_id parameter
+    # Include user_id in cache key for user-specific caching, or 'global' if no user_id
+    cache_user_prefix = user_id if user_id else "global_fallback" # More descriptive than just "global"
+    normalized_cache_key = f"tavily_search_{cache_user_prefix}_{search_query.lower().replace(' ', '_')}"
+
     if normalized_cache_key in search_results_cache:
-        logger.info(f"Tavily Search: Cache hit for query: '{search_query}'")
+        logger.info(f"Tavily Search: Cache hit for query: '{search_query}', UserID: {user_id or 'N/A (global_fallback used)'}")
         return search_results_cache[normalized_cache_key]
 
-    tavily_api_key_val = get_api_key("TAVILY")
+    # Pass user_id to get_api_key
+    tavily_api_key_val = get_api_key("TAVILY", user_id=user_id)
     if not tavily_api_key_val:
-        error_logger.critical("TAVILY_API_KEY not found.")
-        raise ValueError("TAVILY_API_KEY is not set.")
+        # get_api_key already logs a warning. This log is more specific to the function's context.
+        error_logger.error(f"Tavily Search: TAVILY_API_KEY not found for UserID: {user_id or 'N/A (global_fallback attempted)'}. Cannot perform search.")
+        # Original code raised ValueError. Let's maintain that to signal a hard stop for this operation.
+        raise ValueError(f"Tavily API key not available for UserID: {user_id or 'N/A (global_fallback attempted)'}. Search cannot proceed.")
 
     try:
-        logger.info(f"Tavily Search: Performing API search for query: '{search_query}'")
+        # Log which key is being used (user-specific or fallback from env, get_api_key handles that detail)
+        logger.info(f"Tavily Search: Performing API search for query: '{search_query}', UserID: {user_id or 'N/A'}.")
         response = requests.post(
             "https://api.tavily.com/search",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
@@ -718,132 +826,169 @@ def search_with_tavily(search_query: str) -> List[str]:
                 "search_depth": "advanced", "include_answer": False, "max_results": 7
             }
         )
-        response.raise_for_status()
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
         response_data = response.json()
         extracted_urls = [r["url"] for r in response_data.get("results", []) if r.get("url")]
+
         search_results_cache[normalized_cache_key] = extracted_urls
-        logger.info(f"Tavily Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}'")
+        logger.info(f"Tavily Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}', UserID: {user_id or 'N/A'}")
         return extracted_urls
-    except requests.exceptions.RequestException as e_tavily_req:
-        error_logger.error(f"Tavily Search API request failed for query '{search_query}': {e_tavily_req}")
+    except requests.exceptions.HTTPError as e_tavily_http:
+        error_logger.error(f"Tavily Search API HTTP error for query '{search_query}', UserID: {user_id or 'N/A'}: {e_tavily_http}. Response: {e_tavily_http.response.text[:200]}")
+        # If this was a user-supplied key that failed (e.g. 401), we might want to flag the data_source in DB.
+        # That logic is outside this function for now.
         raise
-    except Exception as e_tavily_other:
-        error_logger.error(f"Unexpected error during Tavily search for query '{search_query}': {e_tavily_other}")
+    except requests.exceptions.RequestException as e_tavily_req: # Other network errors
+        error_logger.error(f"Tavily Search API request failed (network/other) for query '{search_query}', UserID: {user_id or 'N/A'}: {e_tavily_req}")
+        raise
+    except Exception as e_tavily_other: # e.g., JSONDecodeError
+        error_logger.error(f"Unexpected error during Tavily search for query '{search_query}', UserID: {user_id or 'N/A'}: {e_tavily_other}\n{traceback.format_exc()}")
         raise
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
-def search_with_serpapi(search_query: str) -> List[str]:
+def search_with_serpapi(search_query: str, user_id: Optional[str] = None) -> List[str]: # Add user_id
     if SerpApiClient is None:
-        logger.warning("SerpAPI search called but library not available.")
+        logger.warning("SerpAPI search called but library not available. Skipping.")
         return []
 
-    normalized_cache_key = f"serpapi_search_{search_query.lower().replace(' ', '_')}"
+    cache_user_prefix = user_id if user_id else "global_fallback"
+    normalized_cache_key = f"serpapi_search_{cache_user_prefix}_{search_query.lower().replace(' ', '_')}"
+
     if normalized_cache_key in search_results_cache:
-        logger.info(f"SerpAPI Search: Cache hit for query: '{search_query}'")
+        logger.info(f"SerpAPI Search: Cache hit for query: '{search_query}', UserID: {user_id or 'N/A (global_fallback used)'}")
         return search_results_cache[normalized_cache_key]
 
-    api_key = get_api_key("SERPAPI")
+    # Pass user_id to get_api_key
+    api_key = get_api_key("SERPAPI", user_id=user_id)
     if not api_key:
-        logger.warning("SERPAPI_API_KEY not found or not set. Skipping SerpAPI search.")
-        return []
+        # get_api_key already logs a warning.
+        logger.warning(f"SerpAPI Search: SERPAPI_API_KEY not found for UserID: {user_id or 'N/A (global_fallback attempted)'}. Skipping SerpAPI search.")
+        return [] # Original behavior was to return empty list, not raise error.
 
     params = {
         "q": search_query,
         "api_key": api_key,
-        "engine": "google",
-        "num": 10
+        "engine": "google", # Or other engines if configurable
+        "num": 10 # Number of results
     }
 
     try:
-        logger.info(f"SerpAPI Search: Performing API search for query: '{search_query}'")
-        search = SerpApiClient(params)
-        results = search.get_dict()
+        logger.info(f"SerpAPI Search: Performing API search for query: '{search_query}', UserID: {user_id or 'N/A'}")
+        search = SerpApiClient(params) # Assuming SerpApiClient handles sync/async appropriately or this function is run in threadpool
+        results = search.get_dict() # This might be a blocking call if SerpApiClient is sync
+
         extracted_urls = [r["link"] for r in results.get("organic_results", []) if "link" in r]
+
         search_results_cache[normalized_cache_key] = extracted_urls
-        logger.info(f"SerpAPI Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}'")
+        logger.info(f"SerpAPI Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}', UserID: {user_id or 'N/A'}")
         return extracted_urls
-    except requests.exceptions.RequestException as e_serpapi_req:
-        error_logger.error(f"SerpAPI Search API request failed for query '{search_query}': {e_serpapi_req}")
+    except requests.exceptions.RequestException as e_serpapi_req: # Catch specific SerpAPI client errors if it uses requests
+        error_logger.error(f"SerpAPI Search API request failed for query '{search_query}', UserID: {user_id or 'N/A'}: {e_serpapi_req}")
+        # Original behavior was to return [], not re-raise for @retry.
+        # If retrying is desired for network issues, this should re-raise.
+        # For now, matching original behavior of returning [] on error.
         return []
     except Exception as e_serpapi_other:
-        error_logger.error(f"Unexpected error during SerpAPI search for query '{search_query}': {e_serpapi_other}\n{traceback.format_exc()}")
-        return []
+        error_logger.error(f"Unexpected error during SerpAPI search for query '{search_query}', UserID: {user_id or 'N/A'}: {e_serpapi_other}\n{traceback.format_exc()}")
+        return [] # Match original behavior
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
-def fetch_from_newsapi_direct(query: str) -> List[Dict[str, Any]]:
+def fetch_from_newsapi_direct(query: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]: # Add user_id
     if NewsApiClient is None:
-        logger.warning("NewsAPI search called but library not available.")
+        logger.warning("NewsAPI direct search called but NewsApiClient library not available. Skipping.")
         return []
 
-    cache_key = f"newsapi_direct_search_{query.lower().replace(' ', '_')}"
+    cache_user_prefix = user_id if user_id else "global_fallback"
+    cache_key = f"newsapi_direct_search_{cache_user_prefix}_{query.lower().replace(' ', '_')}"
+
     if cache_key in search_results_cache:
-        logger.info(f"NewsAPI Direct: Cache hit for query: '{query}'")
+        logger.info(f"NewsAPI Direct: Cache hit for query: '{query}', UserID: {user_id or 'N/A (global_fallback used)'}")
         return search_results_cache[cache_key]
 
-    api_key = get_api_key("NEWS_API")
+    # Pass user_id to get_api_key. Service name is "NEWS_API" as per get_api_key's map
+    api_key = get_api_key("NEWS_API", user_id=user_id)
     if not api_key:
-        logger.warning("NEWSAPI_API_KEY not found or not set. Skipping NewsAPI direct search.")
-        return []
+        logger.warning(f"NewsAPI Direct: NEWSAPI_API_KEY not found for UserID: {user_id or 'N/A (global_fallback attempted)'}. Skipping NewsAPI direct search.")
+        return [] # Original behavior
 
     transformed_articles = []
     try:
-        logger.info(f"NewsAPI Direct: Performing API search for query: '{query}'")
-        newsapi = NewsApiClient(api_key=api_key)
+        logger.info(f"NewsAPI Direct: Performing API search for query: '{query}', UserID: {user_id or 'N/A'}")
+        newsapi = NewsApiClient(api_key=api_key) # Initialize client with the fetched key
+
+        # This call might be blocking if NewsApiClient is sync.
+        # Consider wrapping with run_in_threadpool if called from async context and it's sync.
+        # For now, keeping it as a direct call as per original structure.
         all_articles_raw = newsapi.get_everything(q=query, language='en', sort_by='relevancy', page_size=10)
+
         for article in all_articles_raw.get('articles', []):
             transformed_articles.append({
-                "source": "NewsAPI - " + article.get('source', {}).get('name', 'Unknown'),
+                "source": "NewsAPI - " + article.get('source', {}).get('name', 'Unknown Source'), # More robust source name
                 "title": article.get('title'),
                 "summary": article.get('description'),
-                "full_content": article.get('content', article.get('description')),
+                "full_content": article.get('content', article.get('description')), # Fallback content
                 "url": article.get('url'),
                 "publishedAt": article.get('publishedAt')
             })
+
         search_results_cache[cache_key] = transformed_articles
-        logger.info(f"NewsAPI Direct: Retrieved {len(transformed_articles)} articles for query: '{query}'")
+        logger.info(f"NewsAPI Direct: Retrieved {len(transformed_articles)} articles for query: '{query}', UserID: {user_id or 'N/A'}")
         return transformed_articles
-    except Exception as e_newsapi:
-        error_logger.error(f"NewsAPI Direct search failed for query '{query}': {e_newsapi}\n{traceback.format_exc()}")
-        return []
+    except Exception as e_newsapi: # Catch any exception from NewsApiClient or processing
+        # NewsApiClient might raise its own specific exceptions for bad keys (401) or other issues.
+        # These would be caught here.
+        error_logger.error(f"NewsAPI Direct search failed for query '{query}', UserID: {user_id or 'N/A'}: {e_newsapi}\n{traceback.format_exc()}")
+        # Original behavior was to return [], not re-raise for @retry.
+        # If retrying is desired for NewsAPI failures, this should re-raise.
+        return [] # Match original behavior
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
-def fetch_from_mediastack_direct(query: str) -> List[Dict[str, Any]]:
-    cache_key = f"mediastack_direct_search_{query.lower().replace(' ', '_')}"
+def fetch_from_mediastack_direct(query: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]: # Add user_id
+    cache_user_prefix = user_id if user_id else "global_fallback"
+    cache_key = f"mediastack_direct_search_{cache_user_prefix}_{query.lower().replace(' ', '_')}"
+
     if cache_key in search_results_cache:
-        logger.info(f"MediaStack Direct: Cache hit for query: '{query}'")
+        logger.info(f"MediaStack Direct: Cache hit for query: '{query}', UserID: {user_id or 'N/A (global_fallback used)'}")
         return search_results_cache[cache_key]
 
-    api_key = get_api_key("MEDIASTACK")
+    # Pass user_id to get_api_key. Service name "MEDIASTACK" as per get_api_key's map.
+    api_key = get_api_key("MEDIASTACK", user_id=user_id)
     if not api_key:
-        logger.warning("MEDIASTACK_API_KEY not found or not set. Skipping MediaStack direct search.")
-        return []
+        logger.warning(f"MediaStack Direct: MEDIASTACK_API_KEY not found for UserID: {user_id or 'N/A (global_fallback attempted)'}. Skipping MediaStack direct search.")
+        return [] # Original behavior
 
-    endpoint = "http://api.mediastack.com/v1/news"
+    endpoint = "http://api.mediastack.com/v1/news" # Consider making this a constant or configurable if it varies
     params = {'access_key': api_key, 'keywords': query, 'limit': 10, 'languages': 'en'}
     transformed_articles = []
 
     try:
-        logger.info(f"MediaStack Direct: Performing API search for query: '{query}'")
-        response = requests.get(endpoint, params=params)
-        response.raise_for_status()
+        logger.info(f"MediaStack Direct: Performing API search for query: '{query}', UserID: {user_id or 'N/A'}")
+        # This is a blocking call. Consider run_in_threadpool if called from async graph node.
+        response = requests.get(endpoint, params=params, timeout=10) # Added timeout
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
         data = response.json()
-        for article in data.get('data', []):
+
+        for article in data.get('data', []): # data.data is the list of articles
             transformed_articles.append({
-                "source": "MediaStack - " + article.get('source', 'Unknown'),
+                "source": "MediaStack - " + str(article.get('source', 'Unknown Source')), # Ensure source is string
                 "title": article.get('title'),
                 "summary": article.get('description'),
-                "full_content": article.get('description'),
+                "full_content": article.get('description'), # MediaStack often only provides description
                 "url": article.get('url'),
-                "publishedAt": article.get('published_at')
+                "publishedAt": article.get('published_at') # Note: key is published_at
             })
+
         search_results_cache[cache_key] = transformed_articles
-        logger.info(f"MediaStack Direct: Retrieved {len(transformed_articles)} articles for query: '{query}'")
+        logger.info(f"MediaStack Direct: Retrieved {len(transformed_articles)} articles for query: '{query}', UserID: {user_id or 'N/A'}")
         return transformed_articles
+    except requests.exceptions.HTTPError as e_http:
+        error_logger.error(f"MediaStack Direct API HTTP error for query '{query}', UserID: {user_id or 'N/A'}: {e_http}. Response: {e_http.response.text[:200]}")
+        return []
     except requests.exceptions.RequestException as e_mediastack_req:
-        error_logger.error(f"MediaStack Direct API request failed for query '{query}': {e_mediastack_req}")
+        error_logger.error(f"MediaStack Direct API request failed for query '{query}', UserID: {user_id or 'N/A'}: {e_mediastack_req}")
         return []
     except Exception as e_mediastack_other:
-        error_logger.error(f"Unexpected error during MediaStack Direct search for query '{query}': {e_mediastack_other}\n{traceback.format_exc()}")
+        error_logger.error(f"Unexpected error during MediaStack Direct search for query '{query}', UserID: {user_id or 'N/A'}: {e_mediastack_other}\n{traceback.format_exc()}")
         return []
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
@@ -1152,187 +1297,260 @@ def llm_json_parser_robust(llm_output_str: str, default_return_val: Any = None) 
         return default_return_val if default_return_val is not None else []
 
 async def trend_analyzer(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"Trend Analyzer: Domain='{current_state.market_domain}'")
+    # Ensure necessary imports are available in the file scope:
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # from langchain.chat_models import init_chat_model # For fallback if direct instantiation fails to pick up env var
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, StrOutputParser, json, llm_json_parser_robust, save_state
+
+    logger.info(f"Trend Analyzer: Domain='{current_state.market_domain}', UserID='{current_state.user_id or 'N/A'}'") # Add UserID to log
     default_trends_list = [{"trend_name": "Default Trend", "description": "No specific trends identified.", "supporting_evidence": "N/A", "estimated_impact": "Unknown", "timeframe": "Unknown"}]
+
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Trend Analyzer (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.2)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.2 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"Trend Analyzer: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Trend Analyzer: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            # ChatGoogleGenerativeAI constructor should pick up GOOGLE_API_KEY from env if not provided.
+            # Log a warning if the environment variable is not set.
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Trend Analyzer: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # As a stricter fallback, if the above doesn't implicitly use env vars:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "You are an expert market analyst for {market_domain}. Identify key trends from the provided data. Return a JSON array of objects, each with 'trend_name' (string), 'description' (string), 'supporting_evidence' (string, cite sources if possible), 'estimated_impact' ('High'/'Medium'/'Low'), 'timeframe' ('Short-term'/'Medium-term'/'Long-term'). Aim for 3-5 trends."),
             ("human", "Data for {market_domain} (Query: {query}):\n\nNews/Competitor Info (sample):\n{input_json_data}")
         ])
         chain = prompt | llm | StrOutputParser()
+
         limited_news_data = current_state.raw_news_data[:5] if current_state.raw_news_data else []
         limited_competitor_data = current_state.competitor_data[:5] if current_state.competitor_data else []
         input_data_for_llm = {"news_sample": limited_news_data, "competitors_sample": limited_competitor_data}
-        logger.info(f"Trend Analyzer: Invoking LLM. News items: {len(limited_news_data)}, Competitor items: {len(limited_competitor_data)}")
-        llm_output_string = await chain.ainvoke({ # Use ainvoke
+
+        logger.info(f"Trend Analyzer: Invoking LLM for state {current_state.state_id}. News items: {len(limited_news_data)}, Competitor items: {len(limited_competitor_data)}")
+        llm_output_string = await chain.ainvoke({
             "market_domain": current_state.market_domain,
             "query": current_state.query or "general",
             "input_json_data": json.dumps(input_data_for_llm)
         })
+
         parsed_trends = llm_json_parser_robust(llm_output_string, default_return_val=default_trends_list)
         if not isinstance(parsed_trends, list) or not all(isinstance(t, dict) for t in parsed_trends):
-            logger.warning(f"Trend Analyzer: Parsed trends not a list of dicts. Using default. Output: {llm_output_string[:200]}")
+            logger.warning(f"Trend Analyzer: Parsed trends not a list of dicts for state {current_state.state_id}. Using default. Output: {llm_output_string[:200]}")
             parsed_trends = default_trends_list
-        logger.info(f"Trend Analyzer: Identified {len(parsed_trends)} trends.")
+
+        logger.info(f"Trend Analyzer: Identified {len(parsed_trends)} trends for state {current_state.state_id}.")
         current_state.market_trends = parsed_trends
         
-        # Save trends for download
-        trends_json_path = os.path.join(current_state.report_dir, "market_trends.json")
-        try:
-            with open(trends_json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed_trends, f, indent=4)
-            current_state.download_files["trends_json"] = trends_json_path
-        except Exception as e_json:
-            error_logger.error(f"Failed to save trends JSON '{trends_json_path}': {e_json}")
+        # Save trends for download (existing logic)
+        if current_state.report_dir: # Ensure report_dir exists
+            trends_json_path = os.path.join(current_state.report_dir, "market_trends.json")
+            try:
+                with open(trends_json_path, "w", encoding="utf-8") as f:
+                    json.dump(parsed_trends, f, indent=4)
+                current_state.download_files["trends_json"] = trends_json_path
+                logger.info(f"Trend Analyzer: Saved trends to {trends_json_path} for state {current_state.state_id}")
+            except Exception as e_json:
+                error_logger.error(f"Trend Analyzer: Failed to save trends JSON '{trends_json_path}' for state {current_state.state_id}: {e_json}")
+        else:
+            logger.warning(f"Trend Analyzer: current_state.report_dir not set for state {current_state.state_id}. Cannot save trends JSON.")
             
+    except ValueError as ve: # Catch specific errors like GOOGLE_API_KEY not set from init_chat_model if it raises that
+        error_logger.error(f"Trend Analyzer: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.market_trends = default_trends_list # Fallback
     except Exception as e_trend:
-        error_logger.error(f"Trend Analyzer: Failed for '{current_state.market_domain}': {e_trend}\n{traceback.format_exc()}")
-        current_state.market_trends = default_trends_list
+        error_logger.error(f"Trend Analyzer: Failed for state {current_state.state_id} ('{current_state.market_domain}'): {e_trend}\n{traceback.format_exc()}")
+        current_state.market_trends = default_trends_list # Fallback
+
     save_state(current_state)
-    logger.info("Trend Analyzer: Node completed.")
+    logger.info(f"Trend Analyzer: Node completed for state {current_state.state_id}.") # Add state_id to log
     return current_state.model_dump()
 
 async def opportunity_identifier(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"Opportunity Identifier: Domain='{current_state.market_domain}'")
-    default_ops = [{"opportunity_name": "Default Opportunity", "description": "N/A"}]
+    # Ensure necessary imports are available in the file scope
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # from langchain.chat_models import init_chat_model # For fallback if direct instantiation fails
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, StrOutputParser, json, llm_json_parser_robust, save_state
+
+    logger.info(f"Opportunity Identifier: Domain='{current_state.market_domain}', UserID='{current_state.user_id or 'N/A'}'") # Add UserID
+    default_ops = [{"opportunity_name": "Default Opportunity", "description": "N/A", "target_segment": "N/A", "competitive_advantage": "N/A", "estimated_potential": "Unknown", "timeframe_to_capture": "Unknown"}]
+
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Opportunity Identifier (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.3 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"Opportunity Identifier: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Opportunity Identifier: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Opportunity Identifier: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "Identify market opportunities for {market_domain} based on trends, news, and competitor data. Return JSON array: 'opportunity_name', 'description', 'target_segment', 'competitive_advantage', 'estimated_potential' (High/Medium/Low), 'timeframe_to_capture'. Min 2-3."),
             ("human", "Context for {market_domain}:\nTrends: {trends_json}\nNews/Competitors (sample): {data_json}")
         ])
         chain = prompt | llm | StrOutputParser()
+
         limited_news = current_state.raw_news_data[:5] if current_state.raw_news_data else []
-        llm_output = await chain.ainvoke({ # Use ainvoke
+        # Make sure default_ops has all keys the prompt expects if parsed_ops is not a list of dicts later
+        llm_output = await chain.ainvoke({
             "market_domain": current_state.market_domain,
-            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []),
+            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []), # Ensure market_trends exists
             "data_json": json.dumps({"news_sample": limited_news})
         })
-        parsed_ops = llm_json_parser_robust(llm_output, default_return_val=default_ops)
-        current_state.opportunities = parsed_ops if isinstance(parsed_ops, list) else default_ops
         
-        # Save opportunities for download
-        opportunities_json_path = os.path.join(current_state.report_dir, "opportunities.json")
-        try:
-            with open(opportunities_json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed_ops, f, indent=4)
-            current_state.download_files["opportunities_json"] = opportunities_json_path
-        except Exception as e_json:
-            error_logger.error(f"Failed to save opportunities JSON '{opportunities_json_path}': {e_json}")
+        parsed_ops = llm_json_parser_robust(llm_output, default_return_val=default_ops)
+        if not isinstance(parsed_ops, list) or not all(isinstance(op, dict) for op in parsed_ops):
+            logger.warning(f"Opportunity Identifier: Parsed opportunities not a list of dicts for state {current_state.state_id}. Using default. Output: {llm_output[:200]}")
+            parsed_ops = default_ops
             
+        current_state.opportunities = parsed_ops
+
+        # Save opportunities for download (existing logic)
+        if current_state.report_dir: # Ensure report_dir exists
+            opportunities_json_path = os.path.join(current_state.report_dir, "opportunities.json")
+            try:
+                with open(opportunities_json_path, "w", encoding="utf-8") as f:
+                    json.dump(parsed_ops, f, indent=4)
+                current_state.download_files["opportunities_json"] = opportunities_json_path
+                logger.info(f"Opportunity Identifier: Saved opportunities to {opportunities_json_path} for state {current_state.state_id}")
+            except Exception as e_json:
+                error_logger.error(f"Opportunity Identifier: Failed to save opportunities JSON '{opportunities_json_path}' for state {current_state.state_id}: {e_json}")
+        else:
+            logger.warning(f"Opportunity Identifier: current_state.report_dir not set for state {current_state.state_id}. Cannot save opportunities JSON.")
+
+    except ValueError as ve:
+        error_logger.error(f"Opportunity Identifier: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.opportunities = default_ops # Fallback
     except Exception as e:
-        error_logger.error(f"Opportunity Identifier failed: {e}\n{traceback.format_exc()}")
-        current_state.opportunities = default_ops
+        error_logger.error(f"Opportunity Identifier: Failed for state {current_state.state_id}: {e}\n{traceback.format_exc()}")
+        current_state.opportunities = default_ops # Fallback
+
     save_state(current_state)
-    logger.info(f"Opportunity Identifier: Found {len(current_state.opportunities)} opportunities.")
+    logger.info(f"Opportunity Identifier: Found {len(current_state.opportunities)} opportunities for state {current_state.state_id}.") # Add state_id
     return current_state.model_dump()
 
 async def strategy_recommender(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"Strategy Recommender: Domain='{current_state.market_domain}'")
-    default_strats = [{"strategy_title": "Default Strategy", "description": "N/A"}]
+    # Ensure necessary imports are available
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, StrOutputParser, json, llm_json_parser_robust, save_state
+
+    logger.info(f"Strategy Recommender: Domain='{current_state.market_domain}', UserID='{current_state.user_id or 'N/A'}'") # Add UserID
+    default_strats = [{"strategy_title": "Default Strategy", "description": "N/A", "implementation_steps": [], "expected_outcome": "N/A", "resource_requirements": "N/A", "priority_level": "Unknown", "success_metrics": "N/A"}]
+
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Strategy Recommender (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.3 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"Strategy Recommender: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Strategy Recommender: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Strategy Recommender: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "Recommend strategies for {market_domain} based on opportunities, trends, and competitor data. Return JSON array: 'strategy_title', 'description', 'implementation_steps' (list), 'expected_outcome', 'resource_requirements', 'priority_level', 'success_metrics'. Min 2-3."),
             ("human", "Context for {market_domain}:\nOpportunities: {ops_json}\nTrends: {trends_json}\nCompetitors (sample): {comp_json}")
         ])
         chain = prompt | llm | StrOutputParser()
+
         limited_comp = current_state.competitor_data[:5] if current_state.competitor_data else []
-        llm_output = await chain.ainvoke({ # Use ainvoke
+        llm_output = await chain.ainvoke({
             "market_domain": current_state.market_domain,
-            "ops_json": json.dumps(current_state.opportunities[:5] if current_state.opportunities else []),
-            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []),
+            "ops_json": json.dumps(current_state.opportunities[:5] if current_state.opportunities else []), # Ensure opportunities exist
+            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []), # Ensure market_trends exist
             "comp_json": json.dumps({"competitors_sample": limited_comp})
         })
+
         parsed_strats = llm_json_parser_robust(llm_output, default_return_val=default_strats)
-        current_state.strategic_recommendations = parsed_strats if isinstance(parsed_strats, list) else default_strats
+        if not isinstance(parsed_strats, list) or not all(isinstance(s, dict) for s in parsed_strats):
+            logger.warning(f"Strategy Recommender: Parsed strategies not a list of dicts for state {current_state.state_id}. Using default. Output: {llm_output[:200]}")
+            parsed_strats = default_strats
+
+        current_state.strategic_recommendations = parsed_strats
         
-        # Save strategies for download
-        strategies_json_path = os.path.join(current_state.report_dir, "strategies.json")
-        try:
-            with open(strategies_json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed_strats, f, indent=4)
-            current_state.download_files["strategies_json"] = strategies_json_path
-        except Exception as e_json:
-            error_logger.error(f"Failed to save strategies JSON '{strategies_json_path}': {e_json}")
+        # Save strategies for download (existing logic)
+        if current_state.report_dir: # Ensure report_dir exists
+            strategies_json_path = os.path.join(current_state.report_dir, "strategies.json")
+            try:
+                with open(strategies_json_path, "w", encoding="utf-8") as f:
+                    json.dump(parsed_strats, f, indent=4)
+                current_state.download_files["strategies_json"] = strategies_json_path
+                logger.info(f"Strategy Recommender: Saved strategies to {strategies_json_path} for state {current_state.state_id}")
+            except Exception as e_json:
+                error_logger.error(f"Strategy Recommender: Failed to save strategies JSON '{strategies_json_path}' for state {current_state.state_id}: {e_json}")
+        else:
+            logger.warning(f"Strategy Recommender: current_state.report_dir not set for state {current_state.state_id}. Cannot save strategies JSON.")
             
+    except ValueError as ve:
+        error_logger.error(f"Strategy Recommender: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.strategic_recommendations = default_strats # Fallback
     except Exception as e:
-        error_logger.error(f"Strategy Recommender failed: {e}\n{traceback.format_exc()}")
-        current_state.strategic_recommendations = default_strats
+        error_logger.error(f"Strategy Recommender: Failed for state {current_state.state_id}: {e}\n{traceback.format_exc()}")
+        current_state.strategic_recommendations = default_strats # Fallback
+
     save_state(current_state)
-    logger.info(f"Strategy Recommender: Generated {len(current_state.strategic_recommendations)} strategies.")
+    logger.info(f"Strategy Recommender: Generated {len(current_state.strategic_recommendations)} strategies for state {current_state.state_id}.") # Add state_id
     return current_state.model_dump()
 
 async def customer_insights_generator(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"Customer Insights Generator: Domain='{current_state.market_domain}'")
+    # Ensure necessary imports are available
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, StrOutputParser, json, llm_json_parser_robust, save_state, uuid4, sqlite3, get_db_path
+
+    logger.info(f"Customer Insights Generator: Domain='{current_state.market_domain}', UserID='{current_state.user_id or 'N/A'}'") # Add UserID
+
+    # Default insights structure (matches the one in the original code)
     default_insights = [
-        {
-            "segment_name": "Enterprise",
-            "description": "Large organizations with complex needs",
-            "percentage": 35,
-            "key_characteristics": ["High budget", "Long sales cycle", "Multiple stakeholders"],
-            "pain_points": ["Integration complexity", "Security concerns", "Compliance requirements"],
-            "growth_potential": "Medium",
-            "satisfaction_score": 7.8,
-            "retention_rate": 85,
-            "acquisition_cost": "High",
-            "lifetime_value": "Very High"
-        },
-        {
-            "segment_name": "SMB",
-            "description": "Small and medium businesses",
-            "percentage": 45,
-            "key_characteristics": ["Price sensitive", "Quick decision making", "Limited resources"],
-            "pain_points": ["Cost concerns", "Ease of implementation", "Limited technical expertise"],
-            "growth_potential": "High",
-            "satisfaction_score": 8.2,
-            "retention_rate": 75,
-            "acquisition_cost": "Medium",
-            "lifetime_value": "Medium"
-        },
-        {
-            "segment_name": "Startups",
-            "description": "Early stage companies with rapid growth",
-            "percentage": 20,
-            "key_characteristics": ["Innovation focused", "Limited budget", "Agile processes"],
-            "pain_points": ["Scalability", "Quick time-to-value", "Flexible pricing models"],
-            "growth_potential": "Very High",
-            "satisfaction_score": 8.5,
-            "retention_rate": 65,
-            "acquisition_cost": "Low",
-            "lifetime_value": "Variable"
-        }
+        {"segment_name": "Enterprise", "description": "Large organizations with complex needs", "percentage": 35, "key_characteristics": ["High budget", "Long sales cycle", "Multiple stakeholders"], "pain_points": ["Integration complexity", "Security concerns", "Compliance requirements"], "growth_potential": "Medium", "satisfaction_score": 7.8, "retention_rate": 85, "acquisition_cost": "High", "lifetime_value": "Very High"},
+        {"segment_name": "SMB", "description": "Small and medium businesses", "percentage": 45, "key_characteristics": ["Price sensitive", "Quick decision making", "Limited resources"], "pain_points": ["Cost concerns", "Ease of implementation", "Limited technical expertise"], "growth_potential": "High", "satisfaction_score": 8.2, "retention_rate": 75, "acquisition_cost": "Medium", "lifetime_value": "Medium"},
+        {"segment_name": "Startups", "description": "Early stage companies with rapid growth", "percentage": 20, "key_characteristics": ["Innovation focused", "Limited budget", "Agile processes"], "pain_points": ["Scalability", "Quick time-to-value", "Flexible pricing models"], "growth_potential": "Very High", "satisfaction_score": 8.5, "retention_rate": 65, "acquisition_cost": "Low", "lifetime_value": "Variable"}
     ]
     
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Customer Insights Generator (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
-            
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.3 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"Customer Insights Generator: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Customer Insights Generator: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Customer Insights Generator: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "You are a customer insights expert for {market_domain}. Based on the provided market data, identify key customer segments and their characteristics. Return a JSON array of objects, each with 'segment_name', 'description', 'percentage' (numeric), 'key_characteristics' (array), 'pain_points' (array), 'growth_potential' (string), 'satisfaction_score' (numeric 1-10), 'retention_rate' (numeric percentage), 'acquisition_cost' (string), 'lifetime_value' (string). Aim for 3-5 segments."),
             ("human", "Market data for {market_domain}:\nOpportunities: {ops_json}\nTrends: {trends_json}\nCompetitors: {comp_json}")
         ])
-        
         chain = prompt | llm | StrOutputParser()
         
-        # Prepare input data
         limited_ops = current_state.opportunities[:5] if current_state.opportunities else []
         limited_trends = current_state.market_trends[:5] if current_state.market_trends else []
         limited_comp = current_state.competitor_data[:5] if current_state.competitor_data else []
         
-        # Generate customer insights
         llm_output = await chain.ainvoke({
             "market_domain": current_state.market_domain,
             "ops_json": json.dumps(limited_ops),
@@ -1342,68 +1560,114 @@ async def customer_insights_generator(current_state: MarketIntelligenceState) ->
         
         parsed_insights = llm_json_parser_robust(llm_output, default_return_val=default_insights)
         if not isinstance(parsed_insights, list) or not all(isinstance(i, dict) for i in parsed_insights):
-            logger.warning(f"Customer Insights Generator: Parsed insights not a list of dicts. Using default.")
+            logger.warning(f"Customer Insights Generator: Parsed insights not a list of dicts for state {current_state.state_id}. Using default. Output: {llm_output[:200]}")
             parsed_insights = default_insights
             
         current_state.customer_insights = parsed_insights
         
-        # Save customer insights for download
-        insights_json_path = os.path.join(current_state.report_dir, "customer_insights.json")
-        try:
-            with open(insights_json_path, "w", encoding="utf-8") as f:
-                json.dump(parsed_insights, f, indent=4)
-            current_state.download_files["customer_insights_json"] = insights_json_path
-        except Exception as e_json:
-            error_logger.error(f"Failed to save customer insights JSON '{insights_json_path}': {e_json}")
-        
-        # Save to database
-        db_path = get_db_path()
+        # Save customer insights for download (existing logic)
+        if current_state.report_dir: # Ensure report_dir exists
+            insights_json_path = os.path.join(current_state.report_dir, "customer_insights.json")
+            try:
+                with open(insights_json_path, "w", encoding="utf-8") as f:
+                    json.dump(parsed_insights, f, indent=4)
+                current_state.download_files["customer_insights_json"] = insights_json_path
+                logger.info(f"Customer Insights Generator: Saved insights to {insights_json_path} for state {current_state.state_id}")
+            except Exception as e_json:
+                error_logger.error(f"Customer Insights Generator: Failed to save insights JSON '{insights_json_path}' for state {current_state.state_id}: {e_json}")
+        else:
+            logger.warning(f"Customer Insights Generator: current_state.report_dir not set for state {current_state.state_id}. Cannot save insights JSON.")
+
+        # Save to SQLite customer_insights table (existing logic)
+        db_path = get_db_path() # Ensure get_db_path is available
+        conn = None
         try:
             conn = sqlite3.connect(db_path)
             cursor_obj = conn.cursor()
-            for segment in parsed_insights:
-                segment_id = str(uuid4())
-                cursor_obj.execute(
-                    'INSERT OR REPLACE INTO customer_insights (id, state_id, segment_name, segment_data) VALUES (?, ?, ?, ?)',
-                    (segment_id, current_state.state_id, segment.get('segment_name', 'Unknown'), json.dumps(segment))
-                )
+            for segment in parsed_insights: # Ensure parsed_insights is a list of dicts
+                if isinstance(segment, dict):
+                    segment_id = str(uuid4()) # Ensure uuid4 is available
+                    cursor_obj.execute(
+                        'INSERT OR REPLACE INTO customer_insights (id, state_id, segment_name, segment_data) VALUES (?, ?, ?, ?)',
+                        (segment_id, current_state.state_id, segment.get('segment_name', 'Unknown'), json.dumps(segment))
+                    )
+                else:
+                    logger.warning(f"Customer Insights Generator: Skipping invalid segment data during DB save for state {current_state.state_id}: {segment}")
             conn.commit()
-            conn.close()
+        except sqlite3.Error as e_db_sqlite: # More specific exception
+            error_logger.error(f"Customer Insights Generator: SQLite error saving insights to DB for state {current_state.state_id}: {e_db_sqlite}\n{traceback.format_exc()}")
         except Exception as e_db:
-            error_logger.error(f"Failed to save customer insights to database: {e_db}")
+            error_logger.error(f"Customer Insights Generator: Failed to save customer insights to database for state {current_state.state_id}: {e_db}\n{traceback.format_exc()}")
+        finally:
+            if conn:
+                conn.close()
             
-        logger.info(f"Customer Insights Generator: Generated {len(parsed_insights)} customer segments.")
-        
+        logger.info(f"Customer Insights Generator: Generated {len(parsed_insights)} customer segments for state {current_state.state_id}.") # Add state_id
+
+    except ValueError as ve:
+        error_logger.error(f"Customer Insights Generator: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.customer_insights = default_insights # Fallback
     except Exception as e:
-        error_logger.error(f"Customer Insights Generator failed: {e}\n{traceback.format_exc()}")
-        current_state.customer_insights = default_insights
+        error_logger.error(f"Customer Insights Generator: Failed for state {current_state.state_id}: {e}\n{traceback.format_exc()}")
+        current_state.customer_insights = default_insights # Fallback
         
     save_state(current_state)
+    logger.info(f"Customer Insights Generator: Node completed for state {current_state.state_id}.") # Add state_id
     return current_state.model_dump()
 
 async def report_template_generator(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"Report Template Generator: Domain='{current_state.market_domain}'")
-    default_tmpl = f"# Market Intelligence Report: {current_state.market_domain}\n..."
+    # Ensure necessary imports are available
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, StrOutputParser, save_state, traceback
+
+    logger.info(f"Report Template Generator: Domain='{current_state.market_domain}', UserID='{current_state.user_id or 'N/A'}'") # Add UserID
+    default_tmpl = f"# Market Intelligence Report: {current_state.market_domain}\n## Executive Summary\n..." # Made default slightly more structured
+
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Report Template Generator (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.1)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.1 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"Report Template Generator: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Report Template Generator: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Report Template Generator: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt = ChatPromptTemplate.from_messages([
             ("system", "Create a markdown report template for {market_domain} on query '{query}'. Sections: Title, Date, Prepared By, Executive Summary, Key Trends (name, desc, impact, timeframe), Opportunities (name, desc, potential), Recommendations (title, desc, priority), Competitive Landscape, Visualizations (placeholders like ![Chart Description](filename.png)), Appendix. No \`\`\`markdown\`\`\` fences."),
             ("human", "Generate template for market: {market_domain}, query: {query}")
         ])
         chain = prompt | llm | StrOutputParser()
-        generated_template = await chain.ainvoke({ # Use ainvoke
+
+        generated_template = await chain.ainvoke({
             "market_domain": current_state.market_domain,
             "query": current_state.query or "General Overview"
         })
-        current_state.report_template = generated_template.replace("\`\`\`markdown", "").replace("\`\`\`", "").strip() or default_tmpl
+
+        # Clean up potential markdown fences LLM might add around the whole response
+        cleaned_template = generated_template.strip()
+        if cleaned_template.startswith("```markdown"):
+            cleaned_template = cleaned_template[len("```markdown"):].strip()
+        if cleaned_template.endswith("```"):
+            cleaned_template = cleaned_template[:-len("```")].strip()
+
+        current_state.report_template = cleaned_template or default_tmpl
+
+    except ValueError as ve:
+        error_logger.error(f"Report Template Generator: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.report_template = default_tmpl # Fallback
     except Exception as e:
-        error_logger.error(f"Report Template Generator failed: {e}\n{traceback.format_exc()}")
-        current_state.report_template = default_tmpl
+        error_logger.error(f"Report Template Generator: Failed for state {current_state.state_id}: {e}\n{traceback.format_exc()}")
+        current_state.report_template = default_tmpl # Fallback
+
     save_state(current_state)
-    logger.info(f"Report Template Generator: Template length {len(current_state.report_template)}.")
+    logger.info(f"Report Template Generator: Template length {len(current_state.report_template or '')} for state {current_state.state_id}.") # Add state_id
     return current_state.model_dump()
 
 def get_vector_store_path(current_state: MarketIntelligenceState) -> str:
@@ -1470,36 +1734,61 @@ async def setup_vector_store(current_state: MarketIntelligenceState) -> Dict[str
     return current_state.model_dump()
 
 async def rag_query_handler(current_state: MarketIntelligenceState) -> Dict[str, Any]:
-    logger.info(f"RAG Query Handler: StateID='{current_state.state_id}', Question='{current_state.question or 'N/A'}'")
+    # Ensure necessary imports are available
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # import os
+    # logger, error_logger, get_api_key, FAISS, HuggingFaceEmbeddings, RetrievalQA, save_state, traceback
+
+    logger.info(f"RAG Query Handler: StateID='{current_state.state_id}', Question='{current_state.question or 'N/A'}', UserID='{current_state.user_id or 'N/A'}'")
+
     if not current_state.question:
-        logger.info("RAG Query Handler: No question provided. Skipping.")
+        logger.info(f"RAG Query Handler: No question provided for state {current_state.state_id}. Skipping.")
         current_state.query_response = "No question provided for RAG query."
         save_state(current_state)
         return current_state.model_dump()
 
     if not current_state.vector_store_path or not os.path.exists(current_state.vector_store_path):
-        logger.warning(f"RAG Query Handler: Vector store not found at '{current_state.vector_store_path}'. Cannot answer question.")
+        logger.warning(f"RAG Query Handler: Vector store not found at '{current_state.vector_store_path}' for state {current_state.state_id}. Cannot answer question.")
         current_state.query_response = "Vector store not available. Cannot answer question."
         save_state(current_state)
         return current_state.model_dump()
 
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for RAG Query Handler (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set.")
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=current_state.user_id)
+        llm_temperature = 0.2 # Original temperature for this node
+
+        if user_google_api_key:
+            logger.info(f"RAG Query Handler: Using user-provided Google Gemini API key for state {current_state.state_id}")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"RAG Query Handler: Using default Google Gemini API key (from env) for state {current_state.state_id}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"RAG Query Handler: GOOGLE_API_KEY not found in environment for default LLM init for state {current_state.state_id}. LLM calls may fail.")
+            llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
         vector_store = FAISS.load_local(current_state.vector_store_path, embeddings, allow_dangerous_deserialization=True)
-        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.2)
-        qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vector_store.as_retriever(search_kwargs={"k": 5}))
-        response = await qa_chain.ainvoke({"query": current_state.question}) # Use ainvoke
+
+        qa_chain = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            retriever=vector_store.as_retriever(search_kwargs={"k": 5})
+        )
+        response = await qa_chain.ainvoke({"query": current_state.question})
         current_state.query_response = response.get("result", "No response generated.")
-        logger.info(f"RAG Query Handler: Generated response for question: '{current_state.question}'")
+        logger.info(f"RAG Query Handler: Generated response for question: '{current_state.question}' for state {current_state.state_id}")
+
+    except ValueError as ve:
+        error_logger.error(f"RAG Query Handler: Value error for state {current_state.state_id} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        current_state.query_response = f"Error processing question due to configuration: {str(ve)}"
     except Exception as e_rag:
-        error_logger.error(f"RAG Query Handler: Failed to process question '{current_state.question}': {e_rag}\n{traceback.format_exc()}")
+        error_logger.error(f"RAG Query Handler: Failed to process question '{current_state.question}' for state {current_state.state_id}: {e_rag}\n{traceback.format_exc()}")
         current_state.query_response = f"Error processing question: {str(e_rag)}"
 
     save_state(current_state)
-    logger.info("RAG Query Handler: Node completed.")
+    logger.info(f"RAG Query Handler: Node completed for state {current_state.state_id}.")
     return current_state.model_dump()
 
 def generate_charts(current_state: MarketIntelligenceState) -> Dict[str, Any]:
@@ -1821,11 +2110,11 @@ class MarketIntelligenceAgent:
         """Run the complete market intelligence analysis"""
         return await run_market_intelligence_agent(query, market_domain, question)
     
-    async def chat(self, message: str, session_id: str, history: List[Dict[str, Any]] = None) -> str:
+    async def chat(self, message: str, session_id: str, history: List[Dict[str, Any]] = None, user_id: Optional[str] = None) -> str:
         """Handle chat interactions"""
         if history is None:
             history = load_chat_history(session_id)
-        return await chat_with_agent(message, session_id, history)
+        return await chat_with_agent(message, session_id, history, user_id=user_id)
     
     def get_state(self, state_id: str) -> Optional[MarketIntelligenceState]:
         """Get a saved state"""
@@ -1864,8 +2153,8 @@ class MarketIntelligenceAgent:
         
         return None
 
-async def run_market_intelligence_agent(query_str: str, market_domain_str: str, question_str: Optional[str] = None) -> Dict[str, Any]:
-    logger.info(f"Agent Run: Starting with Query='{query_str}', Domain='{market_domain_str}', Question='{question_str or 'N/A'}'")
+async def run_market_intelligence_agent(query_str: str, market_domain_str: str, question_str: Optional[str] = None, user_id: Optional[str] = None) -> Dict[str, Any]: # Added user_id
+    logger.info(f"Agent Run: Starting with Query='{query_str}', Domain='{market_domain_str}', Question='{question_str or 'N/A'}', UserID='{user_id or 'N/A'}'") # Log UserID
     error_state_id = str(uuid4())
     error_report_dir_path = None
     error_report_file_path = None
@@ -1873,9 +2162,10 @@ async def run_market_intelligence_agent(query_str: str, market_domain_str: str, 
         initial_state = MarketIntelligenceState(
             market_domain=market_domain_str,
             query=query_str,
-            question=question_str
+            question=question_str,
+            user_id=user_id # Pass user_id to state
         )
-        logger.info(f"Agent Run: Initial state created with ID: {initial_state.state_id}")
+        logger.info(f"Agent Run: Initial state created with ID: {initial_state.state_id} for UserID: {user_id}")
 
         # Define the workflow graph
         workflow = StateGraph(dict)
@@ -1978,34 +2268,58 @@ async def run_market_intelligence_agent(query_str: str, market_domain_str: str, 
             "error": str(e_agent_run)
         }
 
-async def chat_with_agent(message: str, session_id: str, history: List[Dict[str, Any]]) -> str:
-    logger.info(f"Agent Chat: Received message for session_id {session_id}: '{message}'")
+async def chat_with_agent(message: str, session_id: str, history: List[Dict[str, Any]], user_id: Optional[str] = None) -> str:
+    # Ensure necessary imports are available
+    # from langchain_google_genai import ChatGoogleGenerativeAI
+    # import os
+    # logger, error_logger, get_api_key, ChatPromptTemplate, MessagesPlaceholder, StrOutputParser, HumanMessage, AIMessage, save_chat_message, load_chat_history, traceback
+
+    logger.info(f"Agent Chat: Received message for session_id {session_id}, UserID: {user_id or 'N/A'}: '{message[:100]}...'") # Log UserID
     save_chat_message(session_id, "user", message)
+
     langchain_history = []
-    for msg_data in history:
+    for msg_data in history: # history is already loaded by MarketIntelligenceAgent.chat if it was None
         if msg_data["type"] == "user":
             langchain_history.append(HumanMessage(content=msg_data["content"]))
         elif msg_data["type"] == "ai":
             langchain_history.append(AIMessage(content=msg_data["content"]))
+
     try:
-        if not os.getenv("GOOGLE_API_KEY"):
-            error_logger.critical("GOOGLE_API_KEY not found for Chat (Gemini).")
-            raise ValueError("GOOGLE_API_KEY is not set for chat.")
-        chat_llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.7)
+        user_google_api_key = get_api_key("GOOGLE_GEMINI", user_id=user_id)
+        llm_temperature = 0.7 # Original temperature for chat
+
+        if user_google_api_key:
+            logger.info(f"Chat: Using user-provided Google Gemini API key for session {session_id}, UserID {user_id}")
+            chat_llm = ChatGoogleGenerativeAI(model="gemini-pro", google_api_key=user_google_api_key, temperature=llm_temperature)
+        else:
+            logger.info(f"Chat: Using default Google Gemini API key (from env) for session {session_id}, UserID {user_id or 'N/A (fallback)'}")
+            if not os.getenv("GOOGLE_API_KEY"):
+                error_logger.warning(f"Chat: GOOGLE_API_KEY not found in environment for default LLM init for session {session_id}.")
+            chat_llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=llm_temperature)
+            # Stricter fallback if needed:
+            # chat_llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=llm_temperature)
+
         prompt_template = ChatPromptTemplate.from_messages([
             ("system", "You are a helpful assistant. Respond to the user's query based on the provided chat history."),
             MessagesPlaceholder(variable_name="chat_history"),
             ("human", "{input}")
         ])
         chain = prompt_template | chat_llm | StrOutputParser()
-        # Assuming chain has an ainvoke method for async execution
+
         response_text = await chain.ainvoke({"input": message, "chat_history": langchain_history})
+
         save_chat_message(session_id, "ai", response_text)
-        logger.info(f"Agent Chat: Response generated for session_id {session_id}.")
+        logger.info(f"Agent Chat: Response generated for session_id {session_id}, UserID {user_id or 'N/A'}.")
         return response_text
+
+    except ValueError as ve:
+        error_logger.error(f"Agent Chat: Value error for session {session_id}, UserID {user_id or 'N/A'} (possibly API key issue): {ve}\n{traceback.format_exc()}")
+        error_response = "Sorry, I encountered a configuration error while processing your message."
+        save_chat_message(session_id, "ai", error_response)
+        return error_response
     except Exception as e:
-        error_logger.error(f"Agent Chat: Error processing message for session {session_id}: {e}\n{traceback.format_exc()}")
-        error_response = "Sorry, I encountered an error while processing your message."
+        error_logger.error(f"Agent Chat: Error processing message for session {session_id}, UserID {user_id or 'N/A'}: {e}\n{traceback.format_exc()}")
+        error_response = "Sorry, I encountered an unexpected error while processing your message."
         save_chat_message(session_id, "ai", error_response)
         return error_response
 

@@ -62,6 +62,7 @@ const menuItems = [
 
 export function AppSidebar() {
   const pathname = usePathname()
+  const { user, signOut } = useAuth(); // Added this line
 
   return (
     <Sidebar className="bg-dark-bg border-dark-border">
