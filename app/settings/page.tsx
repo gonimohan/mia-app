@@ -1,20 +1,122 @@
 "use client"
 
-import { Settings, Palette, Bell, Database, User, Moon } from "lucide-react"
-import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Separator } from "@/components/ui/separator"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { Switch } from "@/components/ui/switch"
-import { Label } from "@/components/ui/label"
-import { Button } from "@/components/ui/button"
-import { Input } from "@/components/ui/input"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-import { ColorPaletteSelector } from "@/components/color-palette-selector"
+import { useState, useEffect } from "react";
+import { Settings, Palette, Bell, Database, User, Moon, Loader2 } from "lucide-react";
+import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Separator } from "@/components/ui/separator";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ColorPaletteSelector } from "@/components/color-palette-selector";
+import { useAuth } from "@/components/auth-provider";
+import { useToast } from "@/hooks/use-toast";
+import { createClientComponentClient } from "@supabase/auth-helpers-nextjs";
 
 export default function SettingsPage() {
+  const { user, isLoading: isAuthLoading } = useAuth(); // Use isAuthLoading to prevent premature state setting
+  const { toast } = useToast();
+  const supabase = createClientComponentClient();
+
+  const [displayName, setDisplayName] = useState("");
+  const [initialDisplayName, setInitialDisplayName] = useState(""); // To store initial name for cancel
+  const [userEmail, setUserEmail] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
+  const [isPageLoading, setIsPageLoading] = useState(true);
+
+  useEffect(() => {
+    if (user) {
+      const currentFullName = user.user_metadata?.full_name || user.user_metadata?.name || "";
+      setDisplayName(currentFullName);
+      setInitialDisplayName(currentFullName); // Store initial name
+      setUserEmail(user.email || "");
+      setIsPageLoading(false);
+    } else if (!isAuthLoading) {
+      // If auth is not loading and user is null, means user is not logged in or data not available
+      setIsPageLoading(false);
+      // Optionally redirect or show message if user is null and not loading
+    }
+  }, [user, isAuthLoading]);
+
+  const getAuthToken = async () => {
+    const session = await supabase.auth.getSession();
+    if (session.error) {
+      toast({ title: "Authentication Error", description: session.error.message, variant: "destructive" });
+      return null;
+    }
+    return session.data.session?.access_token;
+  };
+
+  const handleSaveChanges = async () => {
+    setIsSaving(true);
+    const token = await getAuthToken();
+    if (!token) {
+      toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+      setIsSaving(false);
+      return;
+    }
+
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/users/me/profile`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ full_name: displayName }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok) {
+        throw new Error(result.detail || "Failed to update profile.");
+      }
+
+      toast({ title: "Success", description: "Profile updated successfully." });
+      setInitialDisplayName(displayName); // Update initial name to current saved name
+
+      // Refresh Supabase session to get updated user metadata if AuthProvider doesn't auto-update
+      // This can trigger onAuthStateChange in AuthProvider if setup for USER_UPDATED event
+      await supabase.auth.refreshSession();
+      // Supabase client in useAuth should pick up changes via onAuthStateChange listener.
+      // If not, a manual re-fetch or prop update to AuthProvider might be needed, but usually refreshSession is enough.
+
+    } catch (error: any) {
+      toast({ title: "Error", description: error.message, variant: "destructive" });
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  const handleCancelChanges = () => {
+    setDisplayName(initialDisplayName); // Revert to initial name
+  };
+
+
+  if (isPageLoading) {
+    return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Settings className="w-5 h-5 text-gray-400" />
+             <h1 className="text-lg font-semibold text-white">Settings</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center">
+          <Loader2 className="w-10 h-10 text-neon-blue animate-spin" />
+          <p className="ml-3 text-white">Loading account details...</p>
+        </div>
+      </SidebarInset>
+    );
+  }
+
   return (
-    <SidebarInset className="bg-dark-bg">
+    <SidebarInset className="bg-dark-bg flex flex-col h-screen"> {/* Added flex flex-col h-screen for layout */}
       {/* Header */}
       <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
         <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
@@ -241,12 +343,24 @@ export default function SettingsPage() {
               <CardContent className="space-y-4">
                 <div className="grid gap-4 md:grid-cols-2">
                   <div className="space-y-2">
-                    <Label className="text-white">Display Name</Label>
-                    <Input defaultValue="Gen Z User" className="bg-dark-bg border-dark-border text-white" />
+                    <Label className="text-white" htmlFor="displayName">Display Name</Label>
+                    <Input
+                      id="displayName"
+                      value={displayName}
+                      onChange={(e) => setDisplayName(e.target.value)}
+                      className="bg-dark-bg border-dark-border text-white"
+                      disabled={isPageLoading || isSaving}
+                    />
                   </div>
                   <div className="space-y-2">
-                    <Label className="text-white">Email</Label>
-                    <Input defaultValue="user@example.com" className="bg-dark-bg border-dark-border text-white" />
+                    <Label className="text-white" htmlFor="email">Email</Label>
+                    <Input
+                      id="email"
+                      value={userEmail}
+                      readOnly
+                      className="bg-dark-bg border-dark-border text-gray-400"  // Indicate read-only status
+                      disabled={isPageLoading}
+                    />
                   </div>
                 </div>
 
@@ -274,10 +388,20 @@ export default function SettingsPage() {
                 </div>
 
                 <div className="pt-4 border-t border-dark-border flex gap-2">
-                  <Button className="bg-neon-purple/20 border border-neon-purple/50 text-neon-purple hover:bg-neon-purple/30">
+                  <Button
+                    onClick={handleSaveChanges}
+                    disabled={isSaving || isPageLoading || displayName === initialDisplayName}
+                    className="bg-neon-purple/20 border border-neon-purple/50 text-neon-purple hover:bg-neon-purple/30"
+                  >
+                    {isSaving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
                     Save Changes
                   </Button>
-                  <Button variant="outline" className="border-gray-600 text-gray-400">
+                  <Button
+                    variant="outline"
+                    className="border-gray-600 text-gray-400"
+                    onClick={handleCancelChanges}
+                    disabled={isSaving || isPageLoading}
+                  >
                     Cancel
                   </Button>
                 </div>

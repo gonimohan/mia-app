@@ -89,6 +89,9 @@ export default function DataIntegrationPage() {
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
 
+  // State for testing connection
+  const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
+
 
   const getAuthToken = async () => {
     const session = await supabase.auth.getSession();
@@ -113,6 +116,53 @@ export default function DataIntegrationPage() {
       setDataSources([]);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleTestConnection = async (sourceId: string) => {
+    setTestingSourceId(sourceId);
+    try {
+      const token = await getAuthToken();
+      if (!token) {
+        toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+        return;
+      }
+
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources/${sourceId}/test`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      const responseData = await response.json();
+
+      if (!response.ok) { // Handles HTTP errors like 500, 404, 403 from the test endpoint itself
+        throw new Error(responseData.detail || `API error: ${response.status}`);
+      }
+
+      // response.ok is true, now check test_successful from responseData
+      if (responseData.test_successful) {
+        toast({
+          title: "Connection Test Successful",
+          description: `Successfully connected to ${responseData.tested_service_type}. Message: ${responseData.message}`,
+          variant: "default", // Or a success variant if you have one
+        });
+      } else {
+        toast({
+          title: "Connection Test Failed",
+          description: `Failed to connect to ${responseData.tested_service_type}. Reason: ${responseData.message}`,
+          variant: "destructive",
+        });
+      }
+      fetchDataSources(); // Refresh data sources as status might have changed
+    } catch (error: any) {
+      console.error("Test connection error:", error);
+      toast({
+        title: "Connection Test Error",
+        description: error.message || "An unexpected error occurred while testing the connection.",
+        variant: "destructive",
+      });
+    } finally {
+      setTestingSourceId(null);
     }
   };
 
@@ -385,8 +435,15 @@ export default function DataIntegrationPage() {
                           size="sm"
                           variant="outline"
                           className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10"
+                          onClick={() => handleTestConnection(source.id)}
+                          disabled={testingSourceId === source.id}
                         >
-                          Test Connection
+                          {testingSourceId === source.id ? (
+                            <Loader2 className="w-4 h-4 mr-1.5 animate-spin" />
+                          ) : (
+                            <Zap className="w-4 h-4 mr-1.5" />
+                          )}
+                          {testingSourceId === source.id ? "Testing..." : "Test Connection"}
                         </Button>
                         <Button size="sm" className="bg-neon-blue/20 text-neon-blue hover:bg-neon-blue/30">
                           Sync Now
@@ -400,7 +457,8 @@ export default function DataIntegrationPage() {
           </TabsContent>
 
           <TabsContent value="api-keys" className="space-y-4">
-            <APIKeyManager />
+            {/* Pass the live dataSources state to the APIKeyManager */}
+            <APIKeyManager dataSources={dataSources} />
           </TabsContent>
 
           <TabsContent value="real-time" className="space-y-4">
