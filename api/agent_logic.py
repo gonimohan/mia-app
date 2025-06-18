@@ -1,0 +1,1637 @@
+import os
+import json
+import csv
+import sqlite3
+import logging
+import shutil
+import re
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from uuid import uuid4
+from dotenv import load_dotenv
+from pydantic import BaseModel, Field, field_validator
+import traceback
+import argparse
+
+# Import required libraries with proper error handling
+try:
+    from langchain.chat_models import init_chat_model
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.messages import HumanMessage, AIMessage
+    from langgraph.graph import StateGraph, END
+    from langchain_community.document_loaders import WebBaseLoader
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain.chains import RetrievalQA
+except ImportError as e:
+    print(f"Error importing LangChain libraries: {e}")
+    print("Please install required packages: pip install langchain langchain_core langgraph langchain_community")
+
+import requests
+from tenacity import retry, stop_after_attempt, wait_exponential
+from cachetools import TTLCache
+
+# Import optional libraries with fallbacks
+try:
+    from newsapi import NewsApiClient
+except ImportError:
+    NewsApiClient = None
+    print("newsapi-python not installed. NewsAPI functionality will be disabled.")
+
+try:
+    from serpapi import GoogleSearch as SerpApiClient
+except ImportError:
+    SerpApiClient = None
+    print("google-search-results not installed. SerpAPI functionality will be disabled.")
+
+try:
+    import fmpsdk
+except ImportError:
+    fmpsdk = None
+    print("fmpsdk not installed. Financial Modeling Prep functionality will be disabled.")
+
+try:
+    from alpha_vantage.timeseries import TimeSeries
+    from alpha_vantage.fundamentaldata import FundamentalData
+except ImportError:
+    TimeSeries = None
+    FundamentalData = None
+    print("alpha_vantage not installed. Alpha Vantage functionality will be disabled.")
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    import pandas as pd
+    import numpy as np
+except ImportError:
+    plt = None
+    sns = None
+    pd = None
+    np = None
+    print("matplotlib/seaborn/pandas/numpy not installed. Chart generation will be disabled.")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler('market_intelligence.log', mode='a'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+error_logger = logging.getLogger('agent_error_specific_logger')
+error_file_handler = logging.FileHandler('market_intelligence_errors.log', mode='a')
+error_file_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s - %(message)s'))
+error_logger.addHandler(error_file_handler)
+error_logger.setLevel(logging.ERROR)
+error_logger.propagate = False
+
+# Set USER_AGENT early for WebBaseLoader
+if "USER_AGENT" not in os.environ:
+    os.environ["USER_AGENT"] = "MarketIntelligenceAgent/1.0 (+http://example.com/botinfo)"
+    logger.info(f"Default USER_AGENT set to: {os.environ['USER_AGENT']}")
+
+load_dotenv()
+
+search_results_cache = TTLCache(maxsize=100, ttl=3600)
+
+def get_api_key(service_name: str, user_id: Optional[str] = None) -> Optional[str]:
+    logger.debug(f"Retrieving API key for service: {service_name}, UserID: {user_id if user_id else 'N/A'}")
+    env_var_map = {
+        "TAVILY": "TAVILY_API_KEY",
+        "SERPAPI": "SERPAPI_API_KEY",
+        "NEWS_API": "NEWS_API_KEY",
+        "FINANCIAL_MODELING_PREP": "FINANCIAL_MODELING_PREP_API_KEY",
+        "ALPHA_VANTAGE": "ALPHA_VANTAGE_API_KEY",
+        "MEDIASTACK": "MEDIASTACK_API_KEY"
+    }
+    env_var_name = env_var_map.get(service_name.upper(), f"{service_name.upper()}_API_KEY")
+    api_key = os.getenv(env_var_name)
+    if api_key:
+        logger.info(f"API key found for service: {service_name}")
+        return api_key
+    logger.warning(f"API key not found for service: {service_name} (looked for {env_var_name})")
+    return None
+
+def init_db():
+    db_name = 'market_intelligence_agent.db'
+    db_path = ""
+    try:
+        if os.environ.get("VERCEL_ENV"):
+            db_path = os.path.join("/tmp", db_name)
+            logger.info(f"Using Vercel /tmp path for database: {db_path}")
+        else:
+            api_python_dir = os.path.dirname(os.path.abspath(__file__))
+            db_path = os.path.join(api_python_dir, db_name)
+            logger.info(f"Using local path for database: {db_path}")
+
+        conn = sqlite3.connect(db_path)
+        cursor_obj = conn.cursor()
+        cursor_obj.execute('''
+            CREATE TABLE IF NOT EXISTS states (
+                id TEXT PRIMARY KEY,
+                market_domain TEXT,
+                query TEXT,
+                state_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor_obj.execute('''
+            CREATE TABLE IF NOT EXISTS chat_history (
+                session_id TEXT,
+                message_type TEXT,
+                content TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, timestamp)
+            )
+        ''')
+        cursor_obj.execute('''
+            CREATE TABLE IF NOT EXISTS customer_insights (
+                id TEXT PRIMARY KEY,
+                state_id TEXT,
+                segment_name TEXT,
+                segment_data TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (state_id) REFERENCES states(id)
+            )
+        ''')
+        cursor_obj.execute('''
+            CREATE TABLE IF NOT EXISTS downloads (
+                id TEXT PRIMARY KEY,
+                state_id TEXT,
+                category TEXT,
+                file_path TEXT,
+                file_type TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (state_id) REFERENCES states(id)
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info(f"Database '{db_path}' initialized/verified successfully.")
+    except Exception as e_db_init:
+        error_logger.error(f"Failed to initialize database '{db_name}': {e_db_init} (Path attempted: {db_path})")
+        raise
+
+init_db()
+
+class MarketIntelligenceState(BaseModel):
+    raw_news_data: List[Dict[str, Any]] = Field(default_factory=list)
+    competitor_data: List[Dict[str, Any]] = Field(default_factory=list)
+    financial_data: List[Dict] = Field(default_factory=list)
+    market_trends: List[Dict[str, Any]] = Field(default_factory=list)
+    opportunities: List[Dict[str, Any]] = Field(default_factory=list)
+    strategic_recommendations: List[Dict[str, Any]] = Field(default_factory=list)
+    customer_insights: List[Dict[str, Any]] = Field(default_factory=list)
+    market_domain: str = "General Technology"
+    query: Optional[str] = None
+    question: Optional[str] = None
+    query_response: Optional[str] = None
+    report_template: Optional[str] = None
+    vector_store_path: Optional[str] = None
+    state_id: str = Field(default_factory=lambda: str(uuid4()))
+    report_dir: Optional[str] = None
+    chart_paths: List[str] = Field(default_factory=list)
+    download_files: Dict[str, str] = Field(default_factory=dict)
+
+    @field_validator('market_domain')
+    @classmethod
+    def validate_market_domain_value(cls, v_domain: str) -> str:
+        if not v_domain:
+            raise ValueError("Market domain cannot be empty.")
+        if not re.match(r'^[a-zA-Z0-9\s-]+$', v_domain):
+            raise ValueError("Market domain must contain only letters, numbers, spaces, or hyphens.")
+        return v_domain.strip()
+
+    @field_validator('query')
+    @classmethod
+    def validate_query_value(cls, v_query: Optional[str]) -> Optional[str]:
+        if v_query and len(v_query.strip()) < 3:
+            raise ValueError("Query must be at least 3 characters long if provided.")
+        return v_query.strip() if v_query else None
+
+    class Config:
+        validate_assignment = True
+
+def get_db_path():
+    db_name = 'market_intelligence_agent.db'
+    if os.environ.get("VERCEL_ENV"):
+        return os.path.join("/tmp", db_name)
+    else:
+        api_python_dir = os.path.dirname(os.path.abspath(__file__))
+        return os.path.join(api_python_dir, db_name)
+
+def save_state(state_obj: MarketIntelligenceState):
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor_obj = conn.cursor()
+        cursor_obj.execute(
+            'INSERT OR REPLACE INTO states (id, market_domain, query, state_data, created_at) VALUES (?, ?, ?, ?, ?)',
+            (state_obj.state_id, state_obj.market_domain, state_obj.query, state_obj.model_dump_json(), datetime.now())
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"State saved: ID={state_obj.state_id}, Domain='{state_obj.market_domain}' to {db_path}")
+    except Exception as e_save_state:
+        error_logger.error(f"Failed to save state {state_obj.state_id} to {db_path}: {e_save_state}")
+
+def load_state(state_id_to_load: str) -> Optional[MarketIntelligenceState]:
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor_obj = conn.cursor()
+        cursor_obj.execute('SELECT state_data FROM states WHERE id = ?', (state_id_to_load,))
+        result_data_row = cursor_obj.fetchone()
+        conn.close()
+        if result_data_row:
+            loaded_state = MarketIntelligenceState(**json.loads(result_data_row[0]))
+            logger.info(f"State loaded: ID={state_id_to_load}, Domain='{loaded_state.market_domain}' from {db_path}")
+            return loaded_state
+        else:
+            logger.warning(f"State ID '{state_id_to_load}' not found in database at {db_path}.")
+            return None
+    except Exception as e_load_state:
+        error_logger.error(f"Failed to load state {state_id_to_load} from {db_path}: {e_load_state}")
+        return None
+
+def save_chat_message(session_id_val: str, message_type_val: str, content_val: str):
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor_obj = conn.cursor()
+        cursor_obj.execute(
+            'INSERT INTO chat_history (session_id, message_type, content, timestamp) VALUES (?, ?, ?, ?)',
+            (session_id_val, message_type_val, content_val, datetime.now())
+        )
+        conn.commit()
+        conn.close()
+        logger.info(f"Chat message saved: SessionID='{session_id_val}', Type='{message_type_val}' to {db_path}")
+    except Exception as e_save_chat:
+        error_logger.error(f"Failed to save chat message for SessionID '{session_id_val}' to {db_path}: {e_save_chat}")
+
+def load_chat_history(session_id_val: str) -> List[Dict[str, Any]]:
+    db_path = get_db_path()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor_obj = conn.cursor()
+        cursor_obj.execute('SELECT message_type, content FROM chat_history WHERE session_id = ? ORDER BY timestamp ASC', (session_id_val,))
+        messages_history_list = [{"type": row[0], "content": row[1]} for row in cursor_obj.fetchall()]
+        conn.close()
+        logger.info(f"Chat history loaded: SessionID='{session_id_val}', Messages Count={len(messages_history_list)} from {db_path}")
+        return messages_history_list
+    except Exception as e_load_chat:
+        error_logger.error(f"Failed to load chat history for SessionID '{session_id_val}' from {db_path}: {e_load_chat}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def search_with_tavily(search_query: str) -> List[str]:
+    normalized_cache_key = f"tavily_search_{search_query.lower().replace(' ', '_')}"
+    if normalized_cache_key in search_results_cache:
+        logger.info(f"Tavily Search: Cache hit for query: '{search_query}'")
+        return search_results_cache[normalized_cache_key]
+
+    tavily_api_key_val = get_api_key("TAVILY")
+    if not tavily_api_key_val:
+        error_logger.critical("TAVILY_API_KEY not found.")
+        raise ValueError("TAVILY_API_KEY is not set.")
+
+    try:
+        logger.info(f"Tavily Search: Performing API search for query: '{search_query}'")
+        response = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            json={
+                "api_key": tavily_api_key_val, "query": search_query,
+                "search_depth": "advanced", "include_answer": False, "max_results": 7
+            }
+        )
+        response.raise_for_status()
+        response_data = response.json()
+        extracted_urls = [r["url"] for r in response_data.get("results", []) if r.get("url")]
+        search_results_cache[normalized_cache_key] = extracted_urls
+        logger.info(f"Tavily Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}'")
+        return extracted_urls
+    except requests.exceptions.RequestException as e_tavily_req:
+        error_logger.error(f"Tavily Search API request failed for query '{search_query}': {e_tavily_req}")
+        raise
+    except Exception as e_tavily_other:
+        error_logger.error(f"Unexpected error during Tavily search for query '{search_query}': {e_tavily_other}")
+        raise
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def search_with_serpapi(search_query: str) -> List[str]:
+    if SerpApiClient is None:
+        logger.warning("SerpAPI search called but library not available.")
+        return []
+
+    normalized_cache_key = f"serpapi_search_{search_query.lower().replace(' ', '_')}"
+    if normalized_cache_key in search_results_cache:
+        logger.info(f"SerpAPI Search: Cache hit for query: '{search_query}'")
+        return search_results_cache[normalized_cache_key]
+
+    api_key = get_api_key("SERPAPI")
+    if not api_key:
+        logger.warning("SERPAPI_API_KEY not found or not set. Skipping SerpAPI search.")
+        return []
+
+    params = {
+        "q": search_query,
+        "api_key": api_key,
+        "engine": "google",
+        "num": 10
+    }
+
+    try:
+        logger.info(f"SerpAPI Search: Performing API search for query: '{search_query}'")
+        search = SerpApiClient(params)
+        results = search.get_dict()
+        extracted_urls = [r["link"] for r in results.get("organic_results", []) if "link" in r]
+        search_results_cache[normalized_cache_key] = extracted_urls
+        logger.info(f"SerpAPI Search: Retrieved {len(extracted_urls)} URLs for query: '{search_query}'")
+        return extracted_urls
+    except requests.exceptions.RequestException as e_serpapi_req:
+        error_logger.error(f"SerpAPI Search API request failed for query '{search_query}': {e_serpapi_req}")
+        return []
+    except Exception as e_serpapi_other:
+        error_logger.error(f"Unexpected error during SerpAPI search for query '{search_query}': {e_serpapi_other}\n{traceback.format_exc()}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def fetch_from_newsapi_direct(query: str) -> List[Dict[str, Any]]:
+    if NewsApiClient is None:
+        logger.warning("NewsAPI search called but library not available.")
+        return []
+
+    cache_key = f"newsapi_direct_search_{query.lower().replace(' ', '_')}"
+    if cache_key in search_results_cache:
+        logger.info(f"NewsAPI Direct: Cache hit for query: '{query}'")
+        return search_results_cache[cache_key]
+
+    api_key = get_api_key("NEWS_API")
+    if not api_key:
+        logger.warning("NEWSAPI_API_KEY not found or not set. Skipping NewsAPI direct search.")
+        return []
+
+    transformed_articles = []
+    try:
+        logger.info(f"NewsAPI Direct: Performing API search for query: '{query}'")
+        newsapi = NewsApiClient(api_key=api_key)
+        all_articles_raw = newsapi.get_everything(q=query, language='en', sort_by='relevancy', page_size=10)
+        for article in all_articles_raw.get('articles', []):
+            transformed_articles.append({
+                "source": "NewsAPI - " + article.get('source', {}).get('name', 'Unknown'),
+                "title": article.get('title'),
+                "summary": article.get('description'),
+                "full_content": article.get('content', article.get('description')),
+                "url": article.get('url'),
+                "publishedAt": article.get('publishedAt')
+            })
+        search_results_cache[cache_key] = transformed_articles
+        logger.info(f"NewsAPI Direct: Retrieved {len(transformed_articles)} articles for query: '{query}'")
+        return transformed_articles
+    except Exception as e_newsapi:
+        error_logger.error(f"NewsAPI Direct search failed for query '{query}': {e_newsapi}\n{traceback.format_exc()}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def fetch_from_mediastack_direct(query: str) -> List[Dict[str, Any]]:
+    cache_key = f"mediastack_direct_search_{query.lower().replace(' ', '_')}"
+    if cache_key in search_results_cache:
+        logger.info(f"MediaStack Direct: Cache hit for query: '{query}'")
+        return search_results_cache[cache_key]
+
+    api_key = get_api_key("MEDIASTACK")
+    if not api_key:
+        logger.warning("MEDIASTACK_API_KEY not found or not set. Skipping MediaStack direct search.")
+        return []
+
+    endpoint = "http://api.mediastack.com/v1/news"
+    params = {'access_key': api_key, 'keywords': query, 'limit': 10, 'languages': 'en'}
+    transformed_articles = []
+
+    try:
+        logger.info(f"MediaStack Direct: Performing API search for query: '{query}'")
+        response = requests.get(endpoint, params=params)
+        response.raise_for_status()
+        data = response.json()
+        for article in data.get('data', []):
+            transformed_articles.append({
+                "source": "MediaStack - " + article.get('source', 'Unknown'),
+                "title": article.get('title'),
+                "summary": article.get('description'),
+                "full_content": article.get('description'),
+                "url": article.get('url'),
+                "publishedAt": article.get('published_at')
+            })
+        search_results_cache[cache_key] = transformed_articles
+        logger.info(f"MediaStack Direct: Retrieved {len(transformed_articles)} articles for query: '{query}'")
+        return transformed_articles
+    except requests.exceptions.RequestException as e_mediastack_req:
+        error_logger.error(f"MediaStack Direct API request failed for query '{query}': {e_mediastack_req}")
+        return []
+    except Exception as e_mediastack_other:
+        error_logger.error(f"Unexpected error during MediaStack Direct search for query '{query}': {e_mediastack_other}\n{traceback.format_exc()}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def fetch_financial_data_fmp(query: str) -> List[Dict[str, Any]]:
+    if fmpsdk is None:
+        logger.warning("FMP SDK called but library not available.")
+        return []
+
+    cache_key = f"fmp_data_{query.lower().replace(' ', '_')}"
+    if cache_key in search_results_cache:
+        logger.info(f"FMP: Cache hit for query: '{query}'")
+        return search_results_cache[cache_key]
+
+    api_key = get_api_key("FINANCIAL_MODELING_PREP")
+    if not api_key:
+        logger.warning("FMP_API_KEY not found or not set. Skipping FMP data fetch.")
+        return []
+
+    potential_symbols = re.findall(r'\b([A-Z]{1,5})\b', query)
+    symbol_to_use = potential_symbols[0] if potential_symbols else None
+    if not symbol_to_use:
+        logger.warning(f"No valid stock symbol found in query '{query}'. Skipping FMP data fetch.")
+        return []
+
+    fetched_fmp_data = []
+    try:
+        logger.info(f"FMP: Fetching data for symbol '{symbol_to_use}'")
+        profile = fmpsdk.company_profile(apikey=api_key, symbol=symbol_to_use)
+        quote = fmpsdk.quote(apikey=api_key, symbol=symbol_to_use)
+        if profile:
+            fetched_fmp_data.append({
+                "source": "FinancialModelingPrep",
+                "type": "company_profile",
+                "symbol": symbol_to_use,
+                "data": profile[0] if isinstance(profile, list) else profile
+            })
+        if quote:
+            fetched_fmp_data.append({
+                "source": "FinancialModelingPrep",
+                "type": "stock_quote",
+                "symbol": symbol_to_use,
+                "data": quote[0] if isinstance(quote, list) else quote
+            })
+        logger.info(f"FMP: Fetched {len(fetched_fmp_data)} data points for symbol {symbol_to_use}.")
+        search_results_cache[cache_key] = fetched_fmp_data
+        return fetched_fmp_data
+    except Exception as e:
+        error_logger.error(f"FMP data fetching failed for symbol {symbol_to_use}: {e}\n{traceback.format_exc()}")
+        return []
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
+def fetch_financial_data_alphavantage(query: str) -> List[Dict[str, Any]]:
+    if TimeSeries is None or FundamentalData is None:
+        logger.warning("Alpha Vantage library called but not fully available.")
+        return []
+
+    cache_key = f"alphavantage_data_{query.lower().replace(' ', '_')}"
+    if cache_key in search_results_cache:
+        logger.info(f"AlphaVantage: Cache hit for query: '{query}'")
+        return search_results_cache[cache_key]
+
+    api_key = get_api_key("ALPHA_VANTAGE")
+    if not api_key:
+        logger.warning("ALPHA_VANTAGE_API_KEY not found or not set. Skipping Alpha Vantage data fetch.")
+        return []
+
+    potential_symbols = re.findall(r'\b([A-Z]{1,5})\b', query)
+    symbol_to_use = potential_symbols[0] if potential_symbols else None
+    if not symbol_to_use:
+        logger.warning(f"No valid stock symbol found in query '{query}'. Skipping Alpha Vantage data fetch.")
+        return []
+
+    fetched_av_data = []
+    try:
+        if TimeSeries:
+            ts = TimeSeries(key=api_key, output_format='json')
+            data_ts, meta_data_ts = ts.get_daily(symbol=symbol_to_use, outputsize='compact')
+            if data_ts:
+                latest_date = sorted(data_ts.keys(), reverse=True)[0]
+                latest_data_point = data_ts[latest_date]
+                fetched_av_data.append({
+                    "source": "AlphaVantage",
+                    "type": "daily_time_series_latest",
+                    "symbol": symbol_to_use,
+                    "data": {"date": latest_date, **latest_data_point}
+                })
+
+        if FundamentalData:
+            fd = FundamentalData(key=api_key, output_format='json')
+            try:
+                data_overview, _ = fd.get_company_overview(symbol=symbol_to_use)
+                if data_overview:
+                    fetched_av_data.append({
+                        "source": "AlphaVantage",
+                        "type": "company_overview",
+                        "symbol": symbol_to_use,
+                        "data": data_overview
+                    })
+            except Exception as e_overview:
+                logger.warning(f"AlphaVantage: Could not fetch company overview for {symbol_to_use}: {e_overview}")
+
+        logger.info(f"AlphaVantage: Fetched {len(fetched_av_data)} data points for symbol {symbol_to_use}.")
+        search_results_cache[cache_key] = fetched_av_data
+        return fetched_av_data
+    except Exception as e:
+        error_logger.error(f"AlphaVantage data fetching failed for symbol {symbol_to_use}: {e}\n{traceback.format_exc()}")
+        return []
+
+async def fetch_url_content(url_to_fetch: str) -> Dict[str, Any]:
+    try:
+        logger.info(f"WebBaseLoader: Loading content from URL: {url_to_fetch}")
+        loader = WebBaseLoader([url_to_fetch])
+        loaded_docs = await loader.aload() # Use aload for async
+        doc_object = loaded_docs[0] if loaded_docs else None
+
+        if doc_object:
+            raw_page_content = doc_object.page_content
+            cleaned_page_content = re.sub(r'\n\s*\n', '\n\n', raw_page_content).strip()
+            summary_text = cleaned_page_content[:1000]
+            document_title = doc_object.metadata.get("title", "") or os.path.basename(url_to_fetch)
+            if not document_title:
+                document_title = "Untitled Document"
+            logger.info(f"WebBaseLoader: Loaded from {url_to_fetch}. Title: '{document_title}'. Summary (first 50): '{summary_text[:50]}...'")
+            return {"source": url_to_fetch, "title": document_title, "summary": summary_text, "full_content": cleaned_page_content, "url": url_to_fetch}
+        else:
+            logger.warning(f"WebBaseLoader: No document object returned from {url_to_fetch}")
+            return {"source": url_to_fetch, "title": "Content Not Loaded", "summary": "", "full_content": "", "url": url_to_fetch}
+    except Exception as e_fetch_url:
+        error_logger.error(f"WebBaseLoader: Failed to load content from URL '{url_to_fetch}': {e_fetch_url}\n{traceback.format_exc()}")
+        return {"source": url_to_fetch, "title": f"Failed to Load: {os.path.basename(url_to_fetch)}", "summary": str(e_fetch_url), "full_content": "", "url": url_to_fetch}
+
+def get_agent_base_reports_dir():
+    agent_script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_reports_dir = os.path.join(agent_script_dir, "reports1")
+    if os.environ.get("VERCEL_ENV"):
+        base_reports_dir = os.path.join("/tmp", "reports1")
+        logger.info(f"Vercel environment detected. Using /tmp/reports1 for reports base.")
+    else:
+        logger.info(f"Local environment. Using {base_reports_dir} for reports base.")
+    os.makedirs(base_reports_dir, exist_ok=True)
+    return base_reports_dir
+
+async def market_data_collector(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Market Data Collector: Domain='{current_state.market_domain}', Query='{current_state.query or 'N/A'}'")
+    ts_string = datetime.now().strftime("%Y%m%d_%H%M%S")
+    query_prefix = re.sub(r'[^a-zA-Z0-9_-]', '_', (current_state.query or "general").lower().replace(' ', '_')[:20])
+    base_reports_path = get_agent_base_reports_dir()
+    run_report_dir = os.path.join(base_reports_path, f"{query_prefix}_{ts_string}")
+    try:
+        os.makedirs(run_report_dir, exist_ok=True)
+        current_state.report_dir = run_report_dir
+        logger.info(f"Market Data Collector: Report directory set to: {run_report_dir}")
+    except Exception as e_mkdir_report:
+        error_logger.critical(f"CRITICAL: Failed to create report directory '{run_report_dir}': {e_mkdir_report}")
+        raise IOError(f"Cannot create report directory '{run_report_dir}': {e_mkdir_report}")
+
+    json_file_path = os.path.join(run_report_dir, f"{current_state.market_domain.lower().replace(' ', '_')}_data_sources.json")
+    csv_file_path = os.path.join(run_report_dir, f"{current_state.market_domain.lower().replace(' ', '_')}_data_sources.csv")
+
+    news_search_query = f"{current_state.query} {current_state.market_domain} news trends developments emerging technologies"
+    competitor_search_query = f"{current_state.query} {current_state.market_domain} competitor landscape key players market share"
+    news_urls_list = []
+    competitor_urls_list = []
+    serpapi_news_urls_list = []
+    serpapi_competitor_urls_list = []
+
+    try:
+        logger.info("Attempting Tavily search for news URLs...")
+        news_urls_list = search_with_tavily(news_search_query)
+        logger.info(f"Tavily news search returned {len(news_urls_list)} URLs.")
+    except Exception as e_tavily_news:
+        error_logger.error(f"Tavily news search failed: {e_tavily_news}")
+
+    try:
+        logger.info("Attempting Tavily search for competitor URLs...")
+        competitor_urls_list = search_with_tavily(competitor_search_query)
+        logger.info(f"Tavily competitor search returned {len(competitor_urls_list)} URLs.")
+    except Exception as e_tavily_comp:
+        error_logger.error(f"Tavily competitor search failed: {e_tavily_comp}")
+
+    if SerpApiClient is not None:
+        try:
+            logger.info("Attempting SerpAPI search for news URLs...")
+            serpapi_news_urls_list = search_with_serpapi(news_search_query)
+            logger.info(f"SerpAPI news search returned {len(serpapi_news_urls_list)} URLs.")
+        except Exception as e_serp_news:
+            error_logger.error(f"SerpAPI news search failed: {e_serp_news}")
+        try:
+            logger.info("Attempting SerpAPI search for competitor URLs...")
+            serpapi_competitor_urls_list = search_with_serpapi(competitor_search_query)
+            logger.info(f"SerpAPI competitor search returned {len(serpapi_competitor_urls_list)} URLs.")
+        except Exception as e_serp_comp:
+            error_logger.error(f"SerpAPI competitor search failed: {e_serp_comp}")
+    else:
+        logger.info("SerpAPI library not available, skipping SerpAPI searches.")
+
+    combined_unique_urls = list(set(news_urls_list + competitor_urls_list + serpapi_news_urls_list + serpapi_competitor_urls_list))
+    logger.info(f"Market Data Collector: Total unique URLs to process: {len(combined_unique_urls)}")
+
+    all_fetched_data = []
+    current_query_or_domain = current_state.query if current_state.query else current_state.market_domain
+
+    if NewsApiClient is not None:
+        try:
+            logger.info(f"Fetching from NewsAPI for query: '{current_query_or_domain}'")
+            newsapi_articles = fetch_from_newsapi_direct(current_query_or_domain)
+            all_fetched_data.extend(newsapi_articles)
+            logger.info(f"Retrieved {len(newsapi_articles)} articles from NewsAPI.")
+        except Exception as e_newsapi:
+            error_logger.error(f"Failed to fetch from NewsAPI: {e_newsapi}")
+
+    try:
+        logger.info(f"Fetching from MediaStack for query: '{current_query_or_domain}'")
+        mediastack_articles = fetch_from_mediastack_direct(current_query_or_domain)
+        all_fetched_data.extend(mediastack_articles)
+        logger.info(f"Retrieved {len(mediastack_articles)} articles from MediaStack.")
+    except Exception as e_mstack:
+        error_logger.error(f"Failed to fetch from MediaStack: {e_mstack}")
+
+    current_state.financial_data = []
+    if fmpsdk is not None:
+        try:
+            logger.info(f"Fetching financial data from FMP for query: '{current_query_or_domain}'")
+            fmp_fin_data = fetch_financial_data_fmp(current_query_or_domain)
+            current_state.financial_data.extend(fmp_fin_data)
+            logger.info(f"Retrieved {len(fmp_fin_data)} data items from FMP.")
+        except Exception as e_fmp_fin:
+            error_logger.error(f"Failed to fetch financial data from FMP: {e_fmp_fin}")
+
+    if TimeSeries is not None and FundamentalData is not None:
+        try:
+            logger.info(f"Fetching financial data from Alpha Vantage for query: '{current_query_or_domain}'")
+            av_fin_data = fetch_financial_data_alphavantage(current_query_or_domain)
+            current_state.financial_data.extend(av_fin_data)
+            logger.info(f"Retrieved {len(av_fin_data)} data items from Alpha Vantage.")
+        except Exception as e_av_fin:
+            error_logger.error(f"Failed to fetch financial data from Alpha Vantage: {e_av_fin}")
+
+    logger.info(f"Total financial data items collected: {len(current_state.financial_data)}")
+
+    for idx, loop_url in enumerate(combined_unique_urls):
+        if any(article.get("url") == loop_url for article in all_fetched_data):
+            logger.info(f"Market Data Collector: Skipping URL {loop_url} as it was fetched directly.")
+            continue
+        logger.info(f"Market Data Collector: Processing URL {idx + 1}/{len(combined_unique_urls)}: {loop_url}")
+        content_data = await fetch_url_content(loop_url) # Await async call
+        all_fetched_data.append(content_data)
+
+    current_state.raw_news_data = all_fetched_data
+    current_state.competitor_data = all_fetched_data
+
+    try:
+        with open(json_file_path, "w", encoding="utf-8") as f:
+            json.dump(all_fetched_data, f, indent=4)
+        logger.info(f"Market Data Collector: Data saved to JSON: {json_file_path}")
+        current_state.download_files["raw_data_json"] = json_file_path
+    except Exception as e_json:
+        error_logger.error(f"Failed to save JSON '{json_file_path}': {e_json}")
+
+    try:
+        with open(csv_file_path, "w", newline="", encoding="utf-8") as f:
+            field_names_csv = ["title", "summary", "url", "source", "full_content"]
+            writer_csv = csv.DictWriter(f, fieldnames=field_names_csv, extrasaction='ignore')
+            writer_csv.writeheader()
+            writer_csv.writerows(all_fetched_data)
+        logger.info(f"Market Data Collector: Data saved to CSV: {csv_file_path}")
+        current_state.download_files["raw_data_csv"] = csv_file_path
+    except Exception as e_csv:
+        error_logger.error(f"Failed to save CSV '{csv_file_path}': {e_csv}")
+
+    save_state(current_state)
+    logger.info("Market Data Collector: Node completed.")
+    return current_state.model_dump()
+
+def llm_json_parser_robust(llm_output_str: str, default_return_val: Any = None) -> Any:
+    logger.debug(f"LLM JSON Parser: Attempting to parse: {llm_output_str[:200]}...")
+    try:
+        cleaned_llm_output = re.sub(r"\`\`\`json\s*([\s\S]*?)\s*\`\`\`", r"\1", llm_output_str.strip(), flags=re.IGNORECASE)
+        start_brace = cleaned_llm_output.find('{')
+        start_bracket = cleaned_llm_output.find('[')
+        if start_brace == -1 and start_bracket == -1:
+            logger.warning(f"LLM JSON Parser: No JSON object/array start found. Output: {cleaned_llm_output[:200]}")
+            return default_return_val if default_return_val is not None else []
+        json_start_char = '{' if (start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket)) else '['
+        json_start_index = start_brace if json_start_char == '{' else start_bracket
+        open_count = 0
+        json_end_index = -1
+        for i in range(json_start_index, len(cleaned_llm_output)):
+            if cleaned_llm_output[i] == json_start_char:
+                open_count += 1
+            elif (json_start_char == '{' and cleaned_llm_output[i] == '}') or \
+                 (json_start_char == '[' and cleaned_llm_output[i] == ']'):
+                open_count -= 1
+            if open_count == 0:
+                json_end_index = i
+                break
+        if json_end_index == -1:
+            logger.warning(f"LLM JSON Parser: Could not find matching end for '{json_start_char}'. Output: {cleaned_llm_output[:200]}")
+            return default_return_val if default_return_val is not None else []
+        json_str_to_parse = cleaned_llm_output[json_start_index:json_end_index + 1]
+        parsed_json = json.loads(json_str_to_parse)
+        logger.debug("LLM JSON Parser: Successfully parsed JSON.")
+        return parsed_json
+    except json.JSONDecodeError as e_json_decode:
+        error_logger.warning(f"LLM JSON Parser: Parsing failed: {e_json_decode}. String attempted: '{json_str_to_parse[:500] if 'json_str_to_parse' in locals() else cleaned_llm_output[:500]}'")
+        return default_return_val if default_return_val is not None else []
+
+async def trend_analyzer(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Trend Analyzer: Domain='{current_state.market_domain}'")
+    default_trends_list = [{"trend_name": "Default Trend", "description": "No specific trends identified.", "supporting_evidence": "N/A", "estimated_impact": "Unknown", "timeframe": "Unknown"}]
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Trend Analyzer (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.2)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are an expert market analyst for {market_domain}. Identify key trends from the provided data. Return a JSON array of objects, each with 'trend_name' (string), 'description' (string), 'supporting_evidence' (string, cite sources if possible), 'estimated_impact' ('High'/'Medium'/'Low'), 'timeframe' ('Short-term'/'Medium-term'/'Long-term'). Aim for 3-5 trends."),
+            ("human", "Data for {market_domain} (Query: {query}):\n\nNews/Competitor Info (sample):\n{input_json_data}")
+        ])
+        chain = prompt | llm | StrOutputParser()
+        limited_news_data = current_state.raw_news_data[:5] if current_state.raw_news_data else []
+        limited_competitor_data = current_state.competitor_data[:5] if current_state.competitor_data else []
+        input_data_for_llm = {"news_sample": limited_news_data, "competitors_sample": limited_competitor_data}
+        logger.info(f"Trend Analyzer: Invoking LLM. News items: {len(limited_news_data)}, Competitor items: {len(limited_competitor_data)}")
+        llm_output_string = await chain.ainvoke({ # Use ainvoke
+            "market_domain": current_state.market_domain,
+            "query": current_state.query or "general",
+            "input_json_data": json.dumps(input_data_for_llm)
+        })
+        parsed_trends = llm_json_parser_robust(llm_output_string, default_return_val=default_trends_list)
+        if not isinstance(parsed_trends, list) or not all(isinstance(t, dict) for t in parsed_trends):
+            logger.warning(f"Trend Analyzer: Parsed trends not a list of dicts. Using default. Output: {llm_output_string[:200]}")
+            parsed_trends = default_trends_list
+        logger.info(f"Trend Analyzer: Identified {len(parsed_trends)} trends.")
+        current_state.market_trends = parsed_trends
+        
+        # Save trends for download
+        trends_json_path = os.path.join(current_state.report_dir, "market_trends.json")
+        try:
+            with open(trends_json_path, "w", encoding="utf-8") as f:
+                json.dump(parsed_trends, f, indent=4)
+            current_state.download_files["trends_json"] = trends_json_path
+        except Exception as e_json:
+            error_logger.error(f"Failed to save trends JSON '{trends_json_path}': {e_json}")
+            
+    except Exception as e_trend:
+        error_logger.error(f"Trend Analyzer: Failed for '{current_state.market_domain}': {e_trend}\n{traceback.format_exc()}")
+        current_state.market_trends = default_trends_list
+    save_state(current_state)
+    logger.info("Trend Analyzer: Node completed.")
+    return current_state.model_dump()
+
+async def opportunity_identifier(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Opportunity Identifier: Domain='{current_state.market_domain}'")
+    default_ops = [{"opportunity_name": "Default Opportunity", "description": "N/A"}]
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Opportunity Identifier (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Identify market opportunities for {market_domain} based on trends, news, and competitor data. Return JSON array: 'opportunity_name', 'description', 'target_segment', 'competitive_advantage', 'estimated_potential' (High/Medium/Low), 'timeframe_to_capture'. Min 2-3."),
+            ("human", "Context for {market_domain}:\nTrends: {trends_json}\nNews/Competitors (sample): {data_json}")
+        ])
+        chain = prompt | llm | StrOutputParser()
+        limited_news = current_state.raw_news_data[:5] if current_state.raw_news_data else []
+        llm_output = await chain.ainvoke({ # Use ainvoke
+            "market_domain": current_state.market_domain,
+            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []),
+            "data_json": json.dumps({"news_sample": limited_news})
+        })
+        parsed_ops = llm_json_parser_robust(llm_output, default_return_val=default_ops)
+        current_state.opportunities = parsed_ops if isinstance(parsed_ops, list) else default_ops
+        
+        # Save opportunities for download
+        opportunities_json_path = os.path.join(current_state.report_dir, "opportunities.json")
+        try:
+            with open(opportunities_json_path, "w", encoding="utf-8") as f:
+                json.dump(parsed_ops, f, indent=4)
+            current_state.download_files["opportunities_json"] = opportunities_json_path
+        except Exception as e_json:
+            error_logger.error(f"Failed to save opportunities JSON '{opportunities_json_path}': {e_json}")
+            
+    except Exception as e:
+        error_logger.error(f"Opportunity Identifier failed: {e}\n{traceback.format_exc()}")
+        current_state.opportunities = default_ops
+    save_state(current_state)
+    logger.info(f"Opportunity Identifier: Found {len(current_state.opportunities)} opportunities.")
+    return current_state.model_dump()
+
+async def strategy_recommender(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Strategy Recommender: Domain='{current_state.market_domain}'")
+    default_strats = [{"strategy_title": "Default Strategy", "description": "N/A"}]
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Strategy Recommender (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Recommend strategies for {market_domain} based on opportunities, trends, and competitor data. Return JSON array: 'strategy_title', 'description', 'implementation_steps' (list), 'expected_outcome', 'resource_requirements', 'priority_level', 'success_metrics'. Min 2-3."),
+            ("human", "Context for {market_domain}:\nOpportunities: {ops_json}\nTrends: {trends_json}\nCompetitors (sample): {comp_json}")
+        ])
+        chain = prompt | llm | StrOutputParser()
+        limited_comp = current_state.competitor_data[:5] if current_state.competitor_data else []
+        llm_output = await chain.ainvoke({ # Use ainvoke
+            "market_domain": current_state.market_domain,
+            "ops_json": json.dumps(current_state.opportunities[:5] if current_state.opportunities else []),
+            "trends_json": json.dumps(current_state.market_trends[:5] if current_state.market_trends else []),
+            "comp_json": json.dumps({"competitors_sample": limited_comp})
+        })
+        parsed_strats = llm_json_parser_robust(llm_output, default_return_val=default_strats)
+        current_state.strategic_recommendations = parsed_strats if isinstance(parsed_strats, list) else default_strats
+        
+        # Save strategies for download
+        strategies_json_path = os.path.join(current_state.report_dir, "strategies.json")
+        try:
+            with open(strategies_json_path, "w", encoding="utf-8") as f:
+                json.dump(parsed_strats, f, indent=4)
+            current_state.download_files["strategies_json"] = strategies_json_path
+        except Exception as e_json:
+            error_logger.error(f"Failed to save strategies JSON '{strategies_json_path}': {e_json}")
+            
+    except Exception as e:
+        error_logger.error(f"Strategy Recommender failed: {e}\n{traceback.format_exc()}")
+        current_state.strategic_recommendations = default_strats
+    save_state(current_state)
+    logger.info(f"Strategy Recommender: Generated {len(current_state.strategic_recommendations)} strategies.")
+    return current_state.model_dump()
+
+async def customer_insights_generator(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Customer Insights Generator: Domain='{current_state.market_domain}'")
+    default_insights = [
+        {
+            "segment_name": "Enterprise",
+            "description": "Large organizations with complex needs",
+            "percentage": 35,
+            "key_characteristics": ["High budget", "Long sales cycle", "Multiple stakeholders"],
+            "pain_points": ["Integration complexity", "Security concerns", "Compliance requirements"],
+            "growth_potential": "Medium",
+            "satisfaction_score": 7.8,
+            "retention_rate": 85,
+            "acquisition_cost": "High",
+            "lifetime_value": "Very High"
+        },
+        {
+            "segment_name": "SMB",
+            "description": "Small and medium businesses",
+            "percentage": 45,
+            "key_characteristics": ["Price sensitive", "Quick decision making", "Limited resources"],
+            "pain_points": ["Cost concerns", "Ease of implementation", "Limited technical expertise"],
+            "growth_potential": "High",
+            "satisfaction_score": 8.2,
+            "retention_rate": 75,
+            "acquisition_cost": "Medium",
+            "lifetime_value": "Medium"
+        },
+        {
+            "segment_name": "Startups",
+            "description": "Early stage companies with rapid growth",
+            "percentage": 20,
+            "key_characteristics": ["Innovation focused", "Limited budget", "Agile processes"],
+            "pain_points": ["Scalability", "Quick time-to-value", "Flexible pricing models"],
+            "growth_potential": "Very High",
+            "satisfaction_score": 8.5,
+            "retention_rate": 65,
+            "acquisition_cost": "Low",
+            "lifetime_value": "Variable"
+        }
+    ]
+    
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Customer Insights Generator (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+            
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.3)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "You are a customer insights expert for {market_domain}. Based on the provided market data, identify key customer segments and their characteristics. Return a JSON array of objects, each with 'segment_name', 'description', 'percentage' (numeric), 'key_characteristics' (array), 'pain_points' (array), 'growth_potential' (string), 'satisfaction_score' (numeric 1-10), 'retention_rate' (numeric percentage), 'acquisition_cost' (string), 'lifetime_value' (string). Aim for 3-5 segments."),
+            ("human", "Market data for {market_domain}:\nOpportunities: {ops_json}\nTrends: {trends_json}\nCompetitors: {comp_json}")
+        ])
+        
+        chain = prompt | llm | StrOutputParser()
+        
+        # Prepare input data
+        limited_ops = current_state.opportunities[:5] if current_state.opportunities else []
+        limited_trends = current_state.market_trends[:5] if current_state.market_trends else []
+        limited_comp = current_state.competitor_data[:5] if current_state.competitor_data else []
+        
+        # Generate customer insights
+        llm_output = await chain.ainvoke({
+            "market_domain": current_state.market_domain,
+            "ops_json": json.dumps(limited_ops),
+            "trends_json": json.dumps(limited_trends),
+            "comp_json": json.dumps(limited_comp)
+        })
+        
+        parsed_insights = llm_json_parser_robust(llm_output, default_return_val=default_insights)
+        if not isinstance(parsed_insights, list) or not all(isinstance(i, dict) for i in parsed_insights):
+            logger.warning(f"Customer Insights Generator: Parsed insights not a list of dicts. Using default.")
+            parsed_insights = default_insights
+            
+        current_state.customer_insights = parsed_insights
+        
+        # Save customer insights for download
+        insights_json_path = os.path.join(current_state.report_dir, "customer_insights.json")
+        try:
+            with open(insights_json_path, "w", encoding="utf-8") as f:
+                json.dump(parsed_insights, f, indent=4)
+            current_state.download_files["customer_insights_json"] = insights_json_path
+        except Exception as e_json:
+            error_logger.error(f"Failed to save customer insights JSON '{insights_json_path}': {e_json}")
+        
+        # Save to database
+        db_path = get_db_path()
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor_obj = conn.cursor()
+            for segment in parsed_insights:
+                segment_id = str(uuid4())
+                cursor_obj.execute(
+                    'INSERT OR REPLACE INTO customer_insights (id, state_id, segment_name, segment_data) VALUES (?, ?, ?, ?)',
+                    (segment_id, current_state.state_id, segment.get('segment_name', 'Unknown'), json.dumps(segment))
+                )
+            conn.commit()
+            conn.close()
+        except Exception as e_db:
+            error_logger.error(f"Failed to save customer insights to database: {e_db}")
+            
+        logger.info(f"Customer Insights Generator: Generated {len(parsed_insights)} customer segments.")
+        
+    except Exception as e:
+        error_logger.error(f"Customer Insights Generator failed: {e}\n{traceback.format_exc()}")
+        current_state.customer_insights = default_insights
+        
+    save_state(current_state)
+    return current_state.model_dump()
+
+async def report_template_generator(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Report Template Generator: Domain='{current_state.market_domain}'")
+    default_tmpl = f"# Market Intelligence Report: {current_state.market_domain}\n..."
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Report Template Generator (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.1)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "Create a markdown report template for {market_domain} on query '{query}'. Sections: Title, Date, Prepared By, Executive Summary, Key Trends (name, desc, impact, timeframe), Opportunities (name, desc, potential), Recommendations (title, desc, priority), Competitive Landscape, Visualizations (placeholders like ![Chart Description](filename.png)), Appendix. No \`\`\`markdown\`\`\` fences."),
+            ("human", "Generate template for market: {market_domain}, query: {query}")
+        ])
+        chain = prompt | llm | StrOutputParser()
+        generated_template = await chain.ainvoke({ # Use ainvoke
+            "market_domain": current_state.market_domain,
+            "query": current_state.query or "General Overview"
+        })
+        current_state.report_template = generated_template.replace("\`\`\`markdown", "").replace("\`\`\`", "").strip() or default_tmpl
+    except Exception as e:
+        error_logger.error(f"Report Template Generator failed: {e}\n{traceback.format_exc()}")
+        current_state.report_template = default_tmpl
+    save_state(current_state)
+    logger.info(f"Report Template Generator: Template length {len(current_state.report_template)}.")
+    return current_state.model_dump()
+
+def get_vector_store_path(current_state: MarketIntelligenceState) -> str:
+    base_dir = get_agent_base_reports_dir()
+    report_specific_dir = current_state.report_dir or os.path.join(base_dir, f"VS_FALLBACK_{current_state.state_id[:4]}")
+    if not os.path.isabs(report_specific_dir):
+        report_specific_dir = os.path.join(base_dir, report_specific_dir)
+    os.makedirs(report_specific_dir, exist_ok=True)
+    return os.path.join(report_specific_dir, f"vector_store_faiss_{current_state.state_id[:4]}")
+
+async def setup_vector_store(current_state: MarketIntelligenceState) -> Dict[str, Any]: # Changed to async, though FAISS is sync
+    logger.info(f"Vector Store Setup: StateID='{current_state.state_id}'")
+    if not current_state.report_dir:
+        current_state.report_dir = os.path.join(get_agent_base_reports_dir(), f"VS_SETUP_FALLBACK_DIR_{current_state.state_id[:4]}")
+        os.makedirs(current_state.report_dir, exist_ok=True)
+        logger.warning(f"report_dir was not set, using fallback: {current_state.report_dir}")
+
+    vs_data_json_path = os.path.join(current_state.report_dir, f"{current_state.market_domain.lower().replace(' ', '_')}_data_sources.json")
+    docs_for_vs = []
+
+    if os.path.exists(vs_data_json_path):
+        try:
+            with open(vs_data_json_path, "r", encoding="utf-8") as f:
+                data_items = json.load(f)
+                for item in data_items:
+                    content = item.get('full_content') or item.get('summary', '')
+                    if content:
+                        docs_for_vs.append({
+                            "page_content": content,
+                            "metadata": {"source": item.get('source', 'Unknown'), "title": item.get('title', 'Untitled')}
+                        })
+        except Exception as e_json_read:
+            error_logger.error(f"Vector Store Setup: Failed to read JSON '{vs_data_json_path}': {e_json_read}")
+
+    if not docs_for_vs:
+        logger.warning("Vector Store Setup: No documents found for vector store. Creating minimal fallback.")
+        docs_for_vs = [{
+            "page_content": f"Market Intelligence Report for {current_state.market_domain}. Query: {current_state.query or 'N/A'}.",
+            "metadata": {"source": "Fallback", "title": "Fallback Document"}
+        }]
+
+    try:
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        split_docs = []
+        for doc in docs_for_vs:
+            chunks = text_splitter.split_text(doc["page_content"])
+            for chunk in chunks:
+                split_docs.append({"page_content": chunk, "metadata": doc["metadata"]})
+
+        texts = [doc["page_content"] for doc in split_docs]
+        metadatas = [doc["metadata"] for doc in split_docs]
+        vector_store = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
+        vs_path = get_vector_store_path(current_state)
+        vector_store.save_local(vs_path)
+        current_state.vector_store_path = vs_path
+        logger.info(f"Vector Store Setup: Created and saved to '{vs_path}' with {len(split_docs)} chunks.")
+    except Exception as e_vs:
+        error_logger.error(f"Vector Store Setup: Failed to create vector store: {e_vs}\n{traceback.format_exc()}")
+        current_state.vector_store_path = None
+
+    save_state(current_state)
+    logger.info("Vector Store Setup: Node completed.")
+    return current_state.model_dump()
+
+async def rag_query_handler(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"RAG Query Handler: StateID='{current_state.state_id}', Question='{current_state.question or 'N/A'}'")
+    if not current_state.question:
+        logger.info("RAG Query Handler: No question provided. Skipping.")
+        current_state.query_response = "No question provided for RAG query."
+        save_state(current_state)
+        return current_state.model_dump()
+
+    if not current_state.vector_store_path or not os.path.exists(current_state.vector_store_path):
+        logger.warning(f"RAG Query Handler: Vector store not found at '{current_state.vector_store_path}'. Cannot answer question.")
+        current_state.query_response = "Vector store not available. Cannot answer question."
+        save_state(current_state)
+        return current_state.model_dump()
+
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for RAG Query Handler (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set.")
+        embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+        vector_store = FAISS.load_local(current_state.vector_store_path, embeddings, allow_dangerous_deserialization=True)
+        llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.2)
+        qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vector_store.as_retriever(search_kwargs={"k": 5}))
+        response = await qa_chain.ainvoke({"query": current_state.question}) # Use ainvoke
+        current_state.query_response = response.get("result", "No response generated.")
+        logger.info(f"RAG Query Handler: Generated response for question: '{current_state.question}'")
+    except Exception as e_rag:
+        error_logger.error(f"RAG Query Handler: Failed to process question '{current_state.question}': {e_rag}\n{traceback.format_exc()}")
+        current_state.query_response = f"Error processing question: {str(e_rag)}"
+
+    save_state(current_state)
+    logger.info("RAG Query Handler: Node completed.")
+    return current_state.model_dump()
+
+def generate_charts(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Chart Generator: StateID='{current_state.state_id}'")
+    if plt is None or sns is None or pd is None or np is None:
+        logger.warning("Chart Generator: Required libraries not available. Skipping chart generation.")
+        return current_state.model_dump()
+
+    if not current_state.report_dir:
+        logger.warning("Chart Generator: No report directory set. Cannot save charts.")
+        return current_state.model_dump()
+
+    try:
+        sns.set_style("whitegrid")
+        plt.rcParams['figure.figsize'] = (10, 6)
+        plt.rcParams['font.size'] = 10
+
+        # Chart 1: Market Trends Impact
+        if current_state.market_trends:
+            trend_names = [t.get('trend_name', 'Unknown') for t in current_state.market_trends[:5]]
+            impact_values = []
+            for t in current_state.market_trends[:5]:
+                impact = t.get('estimated_impact', 'Medium')
+                if impact == 'High':
+                    impact_values.append(3)
+                elif impact == 'Medium':
+                    impact_values.append(2)
+                else:
+                    impact_values.append(1)
+
+            plt.figure(figsize=(12, 6))
+            bars = plt.bar(trend_names, impact_values, color=['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7'])
+            plt.title(f'Market Trends Impact Analysis - {current_state.market_domain}', fontsize=14, fontweight='bold')
+            plt.xlabel('Trends', fontsize=12)
+            plt.ylabel('Impact Level', fontsize=12)
+            plt.xticks(rotation=45, ha='right')
+            plt.yticks([1, 2, 3], ['Low', 'Medium', 'High'])
+            plt.tight_layout()
+            
+            # Add value labels on bars
+            for bar, value in zip(bars, impact_values):
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                        ['Low', 'Medium', 'High'][int(value)-1],
+                        ha='center', va='bottom', fontweight='bold')
+            
+            chart1_path = os.path.join(current_state.report_dir, "market_trends_impact.png")
+            plt.savefig(chart1_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            current_state.chart_paths.append(chart1_path)
+            logger.info(f"Chart Generator: Saved trends chart to {chart1_path}")
+
+        # Chart 2: Opportunities Potential
+        if current_state.opportunities:
+            opp_names = [o.get('opportunity_name', 'Unknown') for o in current_state.opportunities[:5]]
+            potential_values = []
+            for o in current_state.opportunities[:5]:
+                potential = o.get('estimated_potential', 'Medium')
+                if potential == 'High' or potential == 'Very High':
+                    potential_values.append(3)
+                elif potential == 'Medium':
+                    potential_values.append(2)
+                else:
+                    potential_values.append(1)
+
+            plt.figure(figsize=(10, 8))
+            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+            wedges, texts, autotexts = plt.pie(potential_values, labels=opp_names, autopct='%1.1f%%', 
+                                              colors=colors, startangle=90)
+            plt.title(f'Market Opportunities Distribution - {current_state.market_domain}', 
+                     fontsize=14, fontweight='bold')
+            
+            # Enhance text appearance
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+            
+            chart2_path = os.path.join(current_state.report_dir, "opportunities_distribution.png")
+            plt.savefig(chart2_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            current_state.chart_paths.append(chart2_path)
+            logger.info(f"Chart Generator: Saved opportunities chart to {chart2_path}")
+
+        # Chart 3: Customer Insights Segments
+        if current_state.customer_insights:
+            segment_names = [c.get('segment_name', 'Unknown') for c in current_state.customer_insights[:5]]
+            percentages = [c.get('percentage', 0) for c in current_state.customer_insights[:5]]
+            satisfaction_scores = [c.get('satisfaction_score', 0) for c in current_state.customer_insights[:5]]
+
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Segment distribution
+            colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+            ax1.pie(percentages, labels=segment_names, autopct='%1.1f%%', colors=colors, startangle=90)
+            ax1.set_title('Customer Segment Distribution', fontsize=12, fontweight='bold')
+            
+            # Satisfaction scores
+            bars = ax2.bar(segment_names, satisfaction_scores, color=colors)
+            ax2.set_title('Customer Satisfaction by Segment', fontsize=12, fontweight='bold')
+            ax2.set_ylabel('Satisfaction Score (1-10)')
+            ax2.set_ylim(0, 10)
+            
+            # Add value labels on bars
+            for bar, score in zip(bars, satisfaction_scores):
+                height = bar.get_height()
+                ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                        f'{score:.1f}', ha='center', va='bottom', fontweight='bold')
+            
+            plt.xticks(rotation=45, ha='right')
+            plt.tight_layout()
+            
+            chart3_path = os.path.join(current_state.report_dir, "customer_insights.png")
+            plt.savefig(chart3_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            current_state.chart_paths.append(chart3_path)
+            logger.info(f"Chart Generator: Saved customer insights chart to {chart3_path}")
+
+        # Chart 4: Strategic Recommendations Priority
+        if current_state.strategic_recommendations:
+            strategy_names = [s.get('strategy_title', 'Unknown') for s in current_state.strategic_recommendations[:5]]
+            priority_values = []
+            for s in current_state.strategic_recommendations[:5]:
+                priority = s.get('priority_level', 'Medium')
+                if priority == 'High' or priority == 'Critical':
+                    priority_values.append(3)
+                elif priority == 'Medium':
+                    priority_values.append(2)
+                else:
+                    priority_values.append(1)
+
+            plt.figure(figsize=(12, 6))
+            colors = ['#FF6B6B' if p == 3 else '#FFEAA7' if p == 2 else '#96CEB4' for p in priority_values]
+            bars = plt.barh(strategy_names, priority_values, color=colors)
+            plt.title(f'Strategic Recommendations Priority - {current_state.market_domain}', 
+                     fontsize=14, fontweight='bold')
+            plt.xlabel('Priority Level', fontsize=12)
+            plt.xticks([1, 2, 3], ['Low', 'Medium', 'High'])
+            
+            # Add value labels
+            for bar, value in zip(bars, priority_values):
+                width = bar.get_width()
+                plt.text(width + 0.05, bar.get_y() + bar.get_height()/2.,
+                        ['Low', 'Medium', 'High'][int(value)-1],
+                        ha='left', va='center', fontweight='bold')
+            
+            plt.tight_layout()
+            
+            chart4_path = os.path.join(current_state.report_dir, "strategic_recommendations.png")
+            plt.savefig(chart4_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            current_state.chart_paths.append(chart4_path)
+            logger.info(f"Chart Generator: Saved strategies chart to {chart4_path}")
+
+        # Save chart paths for download
+        current_state.download_files["charts"] = current_state.chart_paths
+
+        logger.info(f"Chart Generator: Generated {len(current_state.chart_paths)} charts.")
+        
+    except Exception as e_chart:
+        error_logger.error(f"Chart Generator: Failed to generate charts: {e_chart}\n{traceback.format_exc()}")
+
+    save_state(current_state)
+    return current_state.model_dump()
+
+async def final_report_generator(current_state: MarketIntelligenceState) -> Dict[str, Any]:
+    logger.info(f"Final Report Generator: StateID='{current_state.state_id}'")
+    if not current_state.report_dir:
+        logger.warning("Final Report Generator: No report directory set. Cannot save report.")
+        return current_state.model_dump()
+
+    try:
+        report_content = current_state.report_template or f"# Market Intelligence Report: {current_state.market_domain}\n\nNo template available."
+        
+        # Replace placeholders with actual data
+        current_date = datetime.now().strftime("%B %d, %Y")
+        report_content = report_content.replace("{{DATE}}", current_date)
+        report_content = report_content.replace("{{MARKET_DOMAIN}}", current_state.market_domain)
+        report_content = report_content.replace("{{QUERY}}", current_state.query or "General Analysis")
+        
+        # Add trends section
+        if current_state.market_trends:
+            trends_section = "\n## Key Market Trends\n\n"
+            for i, trend in enumerate(current_state.market_trends[:5], 1):
+                trends_section += f"### {i}. {trend.get('trend_name', 'Unknown Trend')}\n"
+                trends_section += f"**Description:** {trend.get('description', 'N/A')}\n\n"
+                trends_section += f"**Impact:** {trend.get('estimated_impact', 'Unknown')}\n\n"
+                trends_section += f"**Timeframe:** {trend.get('timeframe', 'Unknown')}\n\n"
+                if trend.get('supporting_evidence'):
+                    trends_section += f"**Evidence:** {trend.get('supporting_evidence')}\n\n"
+                trends_section += "---\n\n"
+            report_content += trends_section
+
+        # Add opportunities section
+        if current_state.opportunities:
+            opportunities_section = "\n## Market Opportunities\n\n"
+            for i, opp in enumerate(current_state.opportunities[:5], 1):
+                opportunities_section += f"### {i}. {opp.get('opportunity_name', 'Unknown Opportunity')}\n"
+                opportunities_section += f"**Description:** {opp.get('description', 'N/A')}\n\n"
+                opportunities_section += f"**Potential:** {opp.get('estimated_potential', 'Unknown')}\n\n"
+                if opp.get('target_segment'):
+                    opportunities_section += f"**Target Segment:** {opp.get('target_segment')}\n\n"
+                opportunities_section += "---\n\n"
+            report_content += opportunities_section
+
+        # Add customer insights section
+        if current_state.customer_insights:
+            insights_section = "\n## Customer Insights\n\n"
+            for i, insight in enumerate(current_state.customer_insights[:5], 1):
+                insights_section += f"### {i}. {insight.get('segment_name', 'Unknown Segment')}\n"
+                insights_section += f"**Description:** {insight.get('description', 'N/A')}\n\n"
+                insights_section += f"**Market Share:** {insight.get('percentage', 0)}%\n\n"
+                insights_section += f"**Satisfaction Score:** {insight.get('satisfaction_score', 'N/A')}/10\n\n"
+                insights_section += f"**Growth Potential:** {insight.get('growth_potential', 'Unknown')}\n\n"
+                if insight.get('pain_points'):
+                    insights_section += f"**Key Pain Points:**\n"
+                    for pain_point in insight.get('pain_points', []):
+                        insights_section += f"- {pain_point}\n"
+                    insights_section += "\n"
+                insights_section += "---\n\n"
+            report_content += insights_section
+
+        # Add strategies section
+        if current_state.strategic_recommendations:
+            strategies_section = "\n## Strategic Recommendations\n\n"
+            for i, strategy in enumerate(current_state.strategic_recommendations[:5], 1):
+                strategies_section += f"### {i}. {strategy.get('strategy_title', 'Unknown Strategy')}\n"
+                strategies_section += f"**Description:** {strategy.get('description', 'N/A')}\n\n"
+                strategies_section += f"**Priority:** {strategy.get('priority_level', 'Unknown')}\n\n"
+                if strategy.get('expected_outcome'):
+                    strategies_section += f"**Expected Outcome:** {strategy.get('expected_outcome')}\n\n"
+                if strategy.get('implementation_steps'):
+                    strategies_section += f"**Implementation Steps:**\n"
+                    for step in strategy.get('implementation_steps', []):
+                        strategies_section += f"- {step}\n"
+                    strategies_section += "\n"
+                strategies_section += "---\n\n"
+            report_content += strategies_section
+
+        # Add charts section
+        if current_state.chart_paths:
+            charts_section = "\n## Visualizations\n\n"
+            for chart_path in current_state.chart_paths:
+                chart_name = os.path.basename(chart_path).replace('.png', '').replace('_', ' ').title()
+                charts_section += f"### {chart_name}\n"
+                charts_section += f"![{chart_name}]({os.path.basename(chart_path)})\n\n"
+            report_content += charts_section
+
+        # Add RAG response if available
+        if current_state.query_response and current_state.question:
+            rag_section = f"\n## Analysis Response\n\n"
+            rag_section += f"**Question:** {current_state.question}\n\n"
+            rag_section += f"**Answer:** {current_state.query_response}\n\n"
+            report_content += rag_section
+
+        # Save the final report
+        report_path = os.path.join(current_state.report_dir, "market_intelligence_report.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report_content)
+        
+        current_state.download_files["final_report"] = report_path
+        logger.info(f"Final Report Generator: Saved report to {report_path}")
+
+        # Generate a summary README
+        readme_content = f"""# Market Intelligence Report - {current_state.market_domain}
+
+Generated on: {current_date}
+Query: {current_state.query or 'General Analysis'}
+
+## Files in this Report
+
+- `market_intelligence_report.md` - Complete market intelligence report
+- `{current_state.market_domain.lower().replace(' ', '_')}_data_sources.json` - Raw data sources
+- `{current_state.market_domain.lower().replace(' ', '_')}_data_sources.csv` - Raw data in CSV format
+- `market_trends.json` - Identified market trends
+- `opportunities.json` - Market opportunities
+- `customer_insights.json` - Customer segment analysis
+- `strategies.json` - Strategic recommendations
+
+## Charts Generated
+
+"""
+        for chart_path in current_state.chart_paths:
+            chart_name = os.path.basename(chart_path).replace('.png', '').replace('_', ' ').title()
+            readme_content += f"- `{os.path.basename(chart_path)}` - {chart_name}\n"
+
+        readme_content += f"""
+## Summary
+
+- **Trends Identified:** {len(current_state.market_trends)}
+- **Opportunities Found:** {len(current_state.opportunities)}
+- **Customer Segments:** {len(current_state.customer_insights)}
+- **Strategic Recommendations:** {len(current_state.strategic_recommendations)}
+- **Charts Generated:** {len(current_state.chart_paths)}
+
+For detailed analysis, see the complete report in `market_intelligence_report.md`.
+"""
+
+        readme_path = os.path.join(current_state.report_dir, "README.md")
+        with open(readme_path, "w", encoding="utf-8") as f:
+            f.write(readme_content)
+        
+        current_state.download_files["readme"] = readme_path
+        logger.info(f"Final Report Generator: Saved README to {readme_path}")
+
+    except Exception as e_report:
+        error_logger.error(f"Final Report Generator: Failed to generate report: {e_report}\n{traceback.format_exc()}")
+
+    save_state(current_state)
+    logger.info("Final Report Generator: Node completed.")
+    return current_state.model_dump()
+
+# MarketIntelligenceAgent class for compatibility with main.py
+class MarketIntelligenceAgent:
+    def __init__(self):
+        self.state = None
+        logger.info("MarketIntelligenceAgent initialized")
+    
+    async def run_analysis(self, query: str, market_domain: str, question: str = None) -> Dict[str, Any]:
+        """Run the complete market intelligence analysis"""
+        return await run_market_intelligence_agent(query, market_domain, question)
+    
+    async def chat(self, message: str, session_id: str, history: List[Dict[str, Any]] = None) -> str:
+        """Handle chat interactions"""
+        if history is None:
+            history = load_chat_history(session_id)
+        return await chat_with_agent(message, session_id, history)
+    
+    def get_state(self, state_id: str) -> Optional[MarketIntelligenceState]:
+        """Get a saved state"""
+        return load_state(state_id)
+    
+    def get_customer_insights(self, state_id: str) -> List[Dict[str, Any]]:
+        """Get customer insights for a specific state"""
+        state = load_state(state_id)
+        if state:
+            return state.customer_insights
+        return []
+    
+    def prepare_download(self, state_id: str, category: str) -> Optional[str]:
+        """Prepare files for download"""
+        state = load_state(state_id)
+        if not state or not state.download_files:
+            return None
+        
+        # Save download record to database
+        db_path = get_db_path()
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor_obj = conn.cursor()
+            download_id = str(uuid4())
+            file_path = state.download_files.get(category)
+            if file_path:
+                cursor_obj.execute(
+                    'INSERT INTO downloads (id, state_id, category, file_path, file_type) VALUES (?, ?, ?, ?, ?)',
+                    (download_id, state_id, category, file_path, os.path.splitext(file_path)[1])
+                )
+                conn.commit()
+                conn.close()
+                return file_path
+        except Exception as e:
+            error_logger.error(f"Failed to prepare download: {e}")
+        
+        return None
+
+async def run_market_intelligence_agent(query_str: str, market_domain_str: str, question_str: Optional[str] = None) -> Dict[str, Any]:
+    logger.info(f"Agent Run: Starting with Query='{query_str}', Domain='{market_domain_str}', Question='{question_str or 'N/A'}'")
+    error_state_id = str(uuid4())
+    error_report_dir_path = None
+    error_report_file_path = None
+    try:
+        initial_state = MarketIntelligenceState(
+            market_domain=market_domain_str,
+            query=query_str,
+            question=question_str
+        )
+        logger.info(f"Agent Run: Initial state created with ID: {initial_state.state_id}")
+
+        # Define the workflow graph
+        workflow = StateGraph(dict)
+        workflow.add_node("market_data_collector", market_data_collector)
+        workflow.add_node("trend_analyzer", trend_analyzer)
+        workflow.add_node("opportunity_identifier", opportunity_identifier)
+        workflow.add_node("strategy_recommender", strategy_recommender)
+        workflow.add_node("customer_insights_generator", customer_insights_generator)
+        workflow.add_node("report_template_generator", report_template_generator)
+        workflow.add_node("setup_vector_store", setup_vector_store)
+        workflow.add_node("rag_query_handler", rag_query_handler)
+        workflow.add_node("generate_charts", generate_charts)
+        workflow.add_node("final_report_generator", final_report_generator)
+
+        # Define the workflow edges
+        workflow.set_entry_point("market_data_collector")
+        workflow.add_edge("market_data_collector", "trend_analyzer")
+        workflow.add_edge("trend_analyzer", "opportunity_identifier")
+        workflow.add_edge("opportunity_identifier", "strategy_recommender")
+        workflow.add_edge("strategy_recommender", "customer_insights_generator")
+        workflow.add_edge("customer_insights_generator", "report_template_generator")
+        workflow.add_edge("report_template_generator", "setup_vector_store")
+        workflow.add_edge("setup_vector_store", "rag_query_handler")
+        workflow.add_edge("rag_query_handler", "generate_charts")
+        workflow.add_edge("generate_charts", "final_report_generator")
+        workflow.add_edge("final_report_generator", END)
+
+        # Compile and run the workflow
+        app = workflow.compile()
+        final_state_dict = await app.ainvoke(initial_state.model_dump()) # Use ainvoke for async
+        final_state = MarketIntelligenceState(**final_state_dict)
+
+        # Prepare return data
+        report_dir_relative = None
+        if final_state.report_dir:
+            if final_state.report_dir.startswith("/tmp/"):
+                report_dir_relative = os.path.relpath(final_state.report_dir, "/tmp")
+            else:
+                base_reports_dir = get_agent_base_reports_dir()
+                report_dir_relative = os.path.relpath(final_state.report_dir, base_reports_dir)
+
+        chart_filenames = [os.path.basename(chart_path) for chart_path in final_state.chart_paths]
+        
+        return_data = {
+            "success": True,
+            "state_id": final_state.state_id,
+            "report_dir_relative": report_dir_relative,
+            "report_filename": "market_intelligence_report.md",
+            "chart_filenames": chart_filenames,
+            "data_json_filename": f"{final_state.market_domain.lower().replace(' ', '_')}_data_sources.json",
+            "data_csv_filename": f"{final_state.market_domain.lower().replace(' ', '_')}_data_sources.csv",
+            "readme_filename": "README.md",
+            "log_filename": "market_intelligence.log",
+            "rag_log_filename": "market_intelligence_errors.log",
+            "vector_store_dirname": os.path.basename(final_state.vector_store_path) if final_state.vector_store_path else None,
+            "query_response": final_state.query_response,
+            "download_files": final_state.download_files
+        }
+
+        logger.info(f"Agent Run: Successfully completed for StateID '{final_state.state_id}'")
+        return return_data
+
+    except Exception as e_agent_run:
+        error_logger.critical(f"Agent Run: CRITICAL FAILURE: {e_agent_run}\n{traceback.format_exc()}")
+        tb_str = traceback.format_exc()
+        try:
+            error_report_dir_path = os.path.join(get_agent_base_reports_dir(), f"ERROR_REPORT_{error_state_id[:8]}")
+            os.makedirs(error_report_dir_path, exist_ok=True)
+            error_report_file_path = os.path.join(error_report_dir_path, f"ERROR_REPORT_{error_state_id[:8]}.md")
+            with open(error_report_file_path, "w", encoding="utf-8") as f:
+                f.write(f"""# Market Intelligence Agent - Error Report
+
+**Error ID:** {error_state_id}
+**Timestamp:** {datetime.now().isoformat()}
+**Query:** {query_str}
+**Market Domain:** {market_domain_str}
+**Question:** {question_str or 'N/A'}
+
+## Error Details
+
+""")
+                f.write(f"\`\`\`\n{tb_str}\n\`\`\`")
+        except Exception as e_error_report:
+            error_logger.error(f"Agent Run: Failed to write error report: {e_error_report}")
+
+        return {
+            "success": False,
+            "state_id": error_state_id,
+            "report_dir_relative": os.path.relpath(error_report_dir_path, get_agent_base_reports_dir()) if error_report_dir_path else None,
+            "report_filename": os.path.basename(error_report_file_path) if error_report_file_path else None,
+            "chart_filenames": [],
+            "data_json_filename": None,
+            "data_csv_filename": None,
+            "readme_filename": None,
+            "log_filename": None,
+            "rag_log_filename": None,
+            "vector_store_dirname": None,
+            "query_response": None,
+            "download_files": None,
+            "error": str(e_agent_run)
+        }
+
+async def chat_with_agent(message: str, session_id: str, history: List[Dict[str, Any]]) -> str:
+    logger.info(f"Agent Chat: Received message for session_id {session_id}: '{message}'")
+    save_chat_message(session_id, "user", message)
+    langchain_history = []
+    for msg_data in history:
+        if msg_data["type"] == "user":
+            langchain_history.append(HumanMessage(content=msg_data["content"]))
+        elif msg_data["type"] == "ai":
+            langchain_history.append(AIMessage(content=msg_data["content"]))
+    try:
+        if not os.getenv("GOOGLE_API_KEY"):
+            error_logger.critical("GOOGLE_API_KEY not found for Chat (Gemini).")
+            raise ValueError("GOOGLE_API_KEY is not set for chat.")
+        chat_llm = init_chat_model(model_name="gemini-pro", model_provider="google_genai", temperature=0.7)
+        prompt_template = ChatPromptTemplate.from_messages([
+            ("system", "You are a helpful assistant. Respond to the user's query based on the provided chat history."),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{input}")
+        ])
+        chain = prompt_template | chat_llm | StrOutputParser()
+        # Assuming chain has an ainvoke method for async execution
+        response_text = await chain.ainvoke({"input": message, "chat_history": langchain_history})
+        save_chat_message(session_id, "ai", response_text)
+        logger.info(f"Agent Chat: Response generated for session_id {session_id}.")
+        return response_text
+    except Exception as e:
+        error_logger.error(f"Agent Chat: Error processing message for session {session_id}: {e}\n{traceback.format_exc()}")
+        error_response = "Sorry, I encountered an error while processing your message."
+        save_chat_message(session_id, "ai", error_response)
+        return error_response
+
+if __name__ == "__main__":
+    cmd_arg_parser = argparse.ArgumentParser(description="Market Intelligence Agent CLI")
+    cmd_arg_parser.add_argument("--query", type=str, default="AI impact on EdTech", help="The main query or topic for market analysis.")
+    cmd_arg_parser.add_argument("--market", type=str, default="EdTech", help="The target market domain for analysis.")
+    cmd_arg_parser.add_argument("--question", type=str, default=None, help="Optional: A specific question for the RAG system about the generated data/report.")
+
+    parsed_cli_args = cmd_arg_parser.parse_args()
+
+    logger.info(f"Agent CLI: Starting with Query='{parsed_cli_args.query}', Market='{parsed_cli_args.market}', Question='{parsed_cli_args.question or 'N/A'}'")
+    # Note: This local CLI runner will need to be adapted to run an async function,
+    # e.g., using asyncio.run()
+    import asyncio
+    cli_run_output = asyncio.run(run_market_intelligence_agent(
+        query_str=parsed_cli_args.query,
+        market_domain_str=parsed_cli_args.market,
+        question_str=parsed_cli_args.question
+    ))
+
+    print("--- Agent CLI Run Summary ---")
+    print(f"Success: {cli_run_output.get('success')}")
+    print(f"State ID: {cli_run_output.get('state_id')}")
+    print(f"Report Directory (relative to /tmp or api_python/reports1): {cli_run_output.get('report_dir_relative')}")
+    print(f"Report Filename: {cli_run_output.get('report_filename')}")
+    if cli_run_output.get("query_response"):
+        print(f"RAG Query Response: {cli_run_output.get('query_response')}")
+    if cli_run_output.get("error"):
+        print(f"Error Message: {cli_run_output.get('error')}")
+
+    if cli_run_output.get("success"):
+        print("To view results, check the 'reports1' directory (likely in '/tmp/reports1/' on Vercel or 'api_python/reports1/' locally), then find the subdirectory indicated by 'report_dir_relative'.")
+    else:
+        print("Agent run encountered errors. Please check logs ('market_intelligence.log', 'market_intelligence_errors.log') in the Python function's log (Vercel) or 'api_python/' directory (local) for details.")
