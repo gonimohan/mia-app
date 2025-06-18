@@ -1,7 +1,8 @@
 "use client"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { BarChart3, TrendingUp, Users, Eye, Database, Download, Settings, Search, Bell, Zap } from "lucide-react"
+import { BarChart3, TrendingUp, Users, Eye, Database, Download, Settings, Search, Bell, Zap, LogOut } from "lucide-react" // Added LogOut
+import { useAuth } from "./auth-provider"; // Added useAuth
 
 import {
   Sidebar,
@@ -180,27 +181,38 @@ export function AppSidebar() {
       </SidebarContent>
 
       <SidebarFooter className="border-t border-dark-border bg-dark-bg">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <div className="flex items-center gap-3 px-2 py-3">
-              <Avatar className="w-8 h-8 border-2 border-neon-blue">
-                <AvatarImage src="/placeholder-user.jpg" />
-                <AvatarFallback className="bg-neon-blue text-dark-bg font-bold">U</AvatarFallback>
-              </Avatar>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-white truncate">Gen Z User</p>
-                <p className="text-xs text-gray-400 truncate">user@example.com</p>
+        {user && ( // Only show if user is logged in
+          <SidebarMenu>
+            <SidebarMenuItem>
+              <div className="flex items-center gap-3 px-2 py-3">
+                <Avatar className="w-8 h-8 border-2 border-neon-blue">
+                  <AvatarImage src={user.user_metadata?.avatar_url || "/placeholder-user.jpg"} />
+                  <AvatarFallback className="bg-neon-blue text-dark-bg font-bold">
+                    {user.email?.charAt(0).toUpperCase() || "U"}
+                  </AvatarFallback>
+                </Avatar>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-white truncate">
+                    {user.user_metadata?.full_name || user.email}
+                  </p>
+                  <p className="text-xs text-gray-400 truncate">{user.email}</p>
+                </div>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="w-8 h-8 text-gray-400 hover:text-neon-pink hover:bg-dark-card"
+                  onClick={async () => {
+                    await signOut();
+                    // Router push to /login is usually handled by middleware or ProtectedRoute after state update
+                  }}
+                  title="Logout"
+                >
+                  <LogOut className="w-4 h-4" />
+                </Button>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="w-8 h-8 text-gray-400 hover:text-neon-blue hover:bg-dark-card"
-              >
-                <Bell className="w-4 h-4" />
-              </Button>
-            </div>
-          </SidebarMenuItem>
-        </SidebarMenu>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        )}
       </SidebarFooter>
 
       <SidebarRail />

@@ -136,12 +136,15 @@ def init_db():
         cursor_obj.execute('''
             CREATE TABLE IF NOT EXISTS states (
                 id TEXT PRIMARY KEY,
+                user_id TEXT, -- Added user_id column
                 market_domain TEXT,
                 query TEXT,
                 state_data TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP -- Will be overridden by ISO string
             )
         ''')
+        # Add an index for user_id for faster lookups
+        cursor_obj.execute("CREATE INDEX IF NOT EXISTS idx_states_user_id ON states (user_id);")
         cursor_obj.execute('''
             CREATE TABLE IF NOT EXISTS chat_history (
                 session_id TEXT,
@@ -232,15 +235,315 @@ def save_state(state_obj: MarketIntelligenceState):
     try:
         conn = sqlite3.connect(db_path)
         cursor_obj = conn.cursor()
+        # Ensure state_obj.user_id is correctly passed and saved
+        logger.debug(f"Saving state for UserID: {state_obj.user_id}, StateID: {state_obj.state_id}")
         cursor_obj.execute(
-            'INSERT OR REPLACE INTO states (id, market_domain, query, state_data, created_at) VALUES (?, ?, ?, ?, ?)',
-            (state_obj.state_id, state_obj.market_domain, state_obj.query, state_obj.model_dump_json(), datetime.now())
+            'INSERT OR REPLACE INTO states (id, user_id, market_domain, query, state_data, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+            (
+                state_obj.state_id,
+                state_obj.user_id, # Save user_id
+                state_obj.market_domain,
+                state_obj.query,
+                state_obj.model_dump_json(),
+                datetime.now(timezone.utc).isoformat() # Use timezone aware ISO8601 string
+            )
         )
         conn.commit()
         conn.close()
-        logger.info(f"State saved: ID={state_obj.state_id}, Domain='{state_obj.market_domain}' to {db_path}")
+        logger.info(f"State saved: ID={state_obj.state_id}, UserID={state_obj.user_id}, Domain='{state_obj.market_domain}' to {db_path}")
     except Exception as e_save_state:
-        error_logger.error(f"Failed to save state {state_obj.state_id} to {db_path}: {e_save_state}")
+        error_logger.error(f"Failed to save state {state_obj.state_id} for UserID {state_obj.user_id} to {db_path}: {e_save_state}")
+
+def list_user_analysis_states(user_id: str) -> List[Dict[str, Any]]:
+    db_path = get_db_path()
+    states_summary = []
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, market_domain, query, created_at, user_id FROM states WHERE user_id = ? ORDER BY DATETIME(created_at) DESC LIMIT 50",
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+
+        column_names = [description[0] for description in cursor.description]
+
+        for row in rows:
+            row_dict = dict(zip(column_names, row))
+            states_summary.append({
+                "state_id": row_dict["id"],
+                "market_domain": row_dict["market_domain"],
+                "query": row_dict["query"],
+                "created_at": row_dict["created_at"],
+                "user_id": row_dict["user_id"]
+            })
+        logger.info(f"Fetched {len(states_summary)} analysis states for UserID {user_id}")
+    except sqlite3.Error as e:
+        error_logger.error(f"SQLite error fetching states for UserID {user_id}: {e}")
+    except Exception as e:
+        error_logger.error(f"Unexpected error fetching states for UserID {user_id}: {e}\n{traceback.format_exc()}")
+    finally:
+        if conn:
+            conn.close()
+    return states_summary
+
+def get_state_download_info(state_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    db_path = get_db_path()
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT query, market_domain, created_at, state_data, user_id FROM states WHERE id = ? AND user_id = ?",
+            (state_id, user_id)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            logger.warning(f"Download Info: State ID {state_id} not found or not owned by user {user_id}")
+            return None
+
+        query, market_domain, created_at, state_data_json, db_user_id = row
+
+        if db_user_id != user_id:
+            logger.error(f"Download Info: Mismatch user_id for state {state_id}. Expected {user_id}, found {db_user_id}.")
+            return None
+
+        try:
+            state_data_dict = json.loads(state_data_json)
+        except json.JSONDecodeError:
+            error_logger.error(f"Download Info: Failed to parse state_data for state {state_id}")
+            return None
+
+        downloadable_files_list = []
+
+        agent_download_files = state_data_dict.get("download_files", {})
+        if isinstance(agent_download_files, dict):
+            for category, full_path in agent_download_files.items():
+                if full_path and isinstance(full_path, str):
+                     downloadable_files_list.append({
+                        "category": category,
+                        "filename": os.path.basename(full_path),
+                        "description": f"{category.replace('_', ' ').title()} file"
+                    })
+                else:
+                    logger.warning(f"Download Info: Invalid path for category '{category}' in state {state_id}: {full_path}")
+
+        agent_chart_paths = state_data_dict.get("chart_paths", [])
+        if isinstance(agent_chart_paths, list):
+            for full_path in agent_chart_paths:
+                if full_path and isinstance(full_path, str):
+                    base = os.path.basename(full_path)
+                    chart_name, _ = os.path.splitext(base)
+                    category_name = f"chart_{chart_name.lower().replace(' ', '_').replace('-', '_')}"
+                    downloadable_files_list.append({
+                        "category": category_name,
+                        "filename": base,
+                        "description": f"Chart: {chart_name.replace('_', ' ').replace('-', ' ').title()}"
+                    })
+                else:
+                     logger.warning(f"Download Info: Invalid chart path in state {state_id}: {full_path}")
+
+        return {
+            "state_id": state_id,
+            "query": query,
+            "market_domain": market_domain,
+            "created_at": created_at,
+            "files": downloadable_files_list
+        }
+
+    except sqlite3.Error as e:
+        error_logger.error(f"Download Info: SQLite error for state {state_id}, user {user_id}: {e}")
+        return None
+    except Exception as e:
+        error_logger.error(f"Download Info: Unexpected error for state {state_id}, user {user_id}: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def get_download_file_path(state_id: str, user_id: str, file_identifier: str) -> Optional[str]:
+    db_path = get_db_path()
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT state_data FROM states WHERE id = ? AND user_id = ?", # Only need state_data
+            (state_id, user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            logger.warning(f"File Download: State ID {state_id} not found or not owned by user {user_id}")
+            return None
+
+        state_data_json = row[0]
+        try:
+            state_data_dict = json.loads(state_data_json)
+        except json.JSONDecodeError:
+            error_logger.error(f"File Download: Failed to parse state_data for state {state_id}")
+            return None
+
+        target_path = None
+
+        # Check in download_files (category lookup)
+        agent_download_files = state_data_dict.get("download_files", {})
+        if isinstance(agent_download_files, dict) and file_identifier in agent_download_files:
+            target_path = agent_download_files[file_identifier]
+
+        # If not found by category, check chart_paths (filename lookup)
+        if not target_path:
+            agent_chart_paths = state_data_dict.get("chart_paths", [])
+            if isinstance(agent_chart_paths, list):
+                for chart_path in agent_chart_paths:
+                    if chart_path and isinstance(chart_path, str) and os.path.basename(chart_path) == file_identifier:
+                        target_path = chart_path
+                        break
+
+        if not target_path or not isinstance(target_path, str):
+            logger.warning(f"File Download: File identifier '{file_identifier}' not found in state {state_id} for user {user_id}.")
+            return None
+
+        # Security Check: Ensure the path is within the expected reports directory
+        reports_base_dir = os.path.abspath(get_agent_base_reports_dir())
+        if not isinstance(target_path, str): # Should be redundant given previous check, but good for safety
+             error_logger.error(f"File Download: target_path is not a string for state {state_id}, identifier {file_identifier}.")
+             return None
+        resolved_target_path = os.path.abspath(target_path)
+
+        if not resolved_target_path.startswith(reports_base_dir):
+            error_logger.error(f"File Download SECURITY ALERT: Attempt to access path '{resolved_target_path}' outside base reports directory '{reports_base_dir}' for state {state_id}, user {user_id}.")
+            return None
+
+        if not os.path.exists(resolved_target_path) or not os.path.isfile(resolved_target_path):
+            error_logger.error(f"File Download: File does not exist or is not a file at path '{resolved_target_path}' for state {state_id}, user {user_id}.")
+            return None
+
+        logger.info(f"File Download: Access validated for path '{resolved_target_path}' for state {state_id}, user {user_id}.")
+        return resolved_target_path
+
+    except sqlite3.Error as e:
+        error_logger.error(f"File Download: SQLite error for state {state_id}, user {user_id}: {e}")
+        return None
+    except Exception as e:
+        error_logger.error(f"File Download: Unexpected error for state {state_id}, user {user_id}: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def list_user_analysis_states(user_id: str) -> List[Dict[str, Any]]:
+    db_path = get_db_path()
+    states_summary = []
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # The DATETIME function is used to ensure correct sorting of ISO8601 strings.
+        cursor.execute(
+            "SELECT id, market_domain, query, created_at, user_id FROM states WHERE user_id = ? ORDER BY DATETIME(created_at) DESC LIMIT 50",
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+
+        column_names = [description[0] for description in cursor.description]
+
+        for row in rows:
+            row_dict = dict(zip(column_names, row))
+            states_summary.append({
+                "state_id": row_dict["id"], # Map db 'id' to 'state_id' for consistency
+                "market_domain": row_dict["market_domain"],
+                "query": row_dict["query"],
+                "created_at": row_dict["created_at"],
+                "user_id": row_dict["user_id"]
+            })
+        logger.info(f"Fetched {len(states_summary)} analysis states for UserID {user_id}")
+    except sqlite3.Error as e:
+        error_logger.error(f"SQLite error fetching states for UserID {user_id}: {e}")
+    except Exception as e:
+        error_logger.error(f"Unexpected error fetching states for UserID {user_id}: {e}\n{traceback.format_exc()}")
+    finally:
+        if conn:
+            conn.close()
+    return states_summary
+
+def get_state_download_info(state_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+    db_path = get_db_path()
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Ensure we select user_id to verify ownership, though it's used in WHERE too
+        cursor.execute(
+            "SELECT query, market_domain, created_at, state_data, user_id FROM states WHERE id = ? AND user_id = ?",
+            (state_id, user_id)
+        )
+        row = cursor.fetchone()
+
+        if not row:
+            logger.warning(f"Download Info: State ID {state_id} not found or not owned by user {user_id}")
+            return None
+
+        query, market_domain, created_at, state_data_json, db_user_id = row
+
+        if db_user_id != user_id:
+            logger.error(f"Download Info: Mismatch user_id for state {state_id}. Expected {user_id}, found {db_user_id}.")
+            return None
+
+        try:
+            state_data_dict = json.loads(state_data_json)
+        except json.JSONDecodeError:
+            error_logger.error(f"Download Info: Failed to parse state_data for state {state_id}")
+            return None
+
+        downloadable_files_list = []
+
+        agent_download_files = state_data_dict.get("download_files", {})
+        if isinstance(agent_download_files, dict):
+            for category, full_path in agent_download_files.items():
+                if full_path and isinstance(full_path, str):
+                     downloadable_files_list.append({
+                        "category": category,
+                        "filename": os.path.basename(full_path),
+                        "description": f"{category.replace('_', ' ').title()} file"
+                    })
+                else:
+                    logger.warning(f"Download Info: Invalid path for category '{category}' in state {state_id}: {full_path}")
+
+        agent_chart_paths = state_data_dict.get("chart_paths", [])
+        if isinstance(agent_chart_paths, list):
+            for full_path in agent_chart_paths:
+                if full_path and isinstance(full_path, str):
+                    base = os.path.basename(full_path)
+                    chart_name, _ = os.path.splitext(base)
+                    # Standardize chart category name
+                    category_name = f"chart_{chart_name.lower().replace(' ', '_').replace('-', '_')}"
+                    downloadable_files_list.append({
+                        "category": category_name,
+                        "filename": base,
+                        "description": f"Chart: {chart_name.replace('_', ' ').replace('-', ' ').title()}"
+                    })
+                else:
+                     logger.warning(f"Download Info: Invalid chart path in state {state_id}: {full_path}")
+
+        return {
+            "state_id": state_id,
+            "query": query,
+            "market_domain": market_domain,
+            "created_at": created_at,
+            "files": downloadable_files_list
+        }
+
+    except sqlite3.Error as e:
+        error_logger.error(f"Download Info: SQLite error for state {state_id}, user {user_id}: {e}")
+        return None
+    except Exception as e:
+        error_logger.error(f"Download Info: Unexpected error for state {state_id}, user {user_id}: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def load_state(state_id_to_load: str) -> Optional[MarketIntelligenceState]:
     db_path = get_db_path()

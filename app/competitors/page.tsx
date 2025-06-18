@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react" // Added useEffect
 import { Users, TrendingUp, TrendingDown, Building, DollarSign, BarChart3, Eye, Search, Filter } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
@@ -9,15 +9,8 @@ import { Separator } from "@/components/ui/separator"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
 import { Progress } from "@/components/ui/progress"
-import {
-  ResponsiveContainer,
-  RadarChart,
-  PolarGrid,
-  PolarAngleAxis,
-  PolarRadiusAxis,
-  Radar,
-  Tooltip as RechartsTooltip,
-} from "recharts"
+// All Recharts imports removed as no charts are left on this page.
+
 import { useColorPalette } from "@/lib/color-context"
 
 interface Competitor {
@@ -31,74 +24,108 @@ interface Competitor {
   weaknesses: string[]
   recentActivity: string
   threat_level: "low" | "medium" | "high"
+  _revenueNumeric?: number; // Added for internal calculation
 }
 
-const mockCompetitors: Competitor[] = [
-  {
-    id: "1",
-    name: "TechCorp Inc",
-    marketShare: 18.5,
-    revenue: "$2.5B",
-    employees: 15000,
-    growthRate: 12.3,
-    strengths: ["Strong R&D", "Global presence", "Brand recognition"],
-    weaknesses: ["High costs", "Slow innovation"],
-    recentActivity: "Launched new AI platform",
-    threat_level: "high",
-  },
-  {
-    id: "2",
-    name: "InnovateLabs",
-    marketShare: 14.2,
-    revenue: "$1.8B",
-    employees: 8500,
-    growthRate: 8.7,
-    strengths: ["Agile development", "Customer focus"],
-    weaknesses: ["Limited resources", "Small market presence"],
-    recentActivity: "Acquired startup for $50M",
-    threat_level: "medium",
-  },
-  {
-    id: "3",
-    name: "FutureSoft",
-    marketShare: 22.1,
-    revenue: "$3.2B",
-    employees: 12000,
-    growthRate: 15.6,
-    strengths: ["Innovation leader", "Strong partnerships"],
-    weaknesses: ["High employee turnover"],
-    recentActivity: "IPO filing announced",
-    threat_level: "high",
-  },
-  {
-    id: "4",
-    name: "DataDrive",
-    marketShare: 9.8,
-    revenue: "$1.2B",
-    employees: 5500,
-    growthRate: 6.2,
-    strengths: ["Data analytics", "Cost efficiency"],
-    weaknesses: ["Limited product range"],
-    recentActivity: "New partnership with Microsoft",
-    threat_level: "low",
-  },
-]
+// const mockCompetitors: Competitor[] = [ ... ] // Removed mockCompetitors
 
-const competitorComparison = [
-  { metric: "Innovation", us: 85, competitor1: 78, competitor2: 92, competitor3: 65 },
-  { metric: "Market Reach", us: 75, competitor1: 88, competitor2: 70, competitor3: 45 },
-  { metric: "Customer Satisfaction", us: 90, competitor1: 82, competitor2: 85, competitor3: 78 },
-  { metric: "Financial Strength", us: 80, competitor1: 85, competitor2: 95, competitor3: 60 },
-  { metric: "Technology", us: 88, competitor1: 75, competitor2: 90, competitor3: 70 },
-  { metric: "Brand Recognition", us: 70, competitor1: 90, competitor2: 75, competitor3: 55 },
-]
+// const competitorComparison = [ ... ] // Removed competitorComparison mock data
 
 export default function CompetitorsPage() {
   const { getChartColors } = useColorPalette()
   const chartColors = getChartColors()
-  const [competitors, setCompetitors] = useState<Competitor[]>(mockCompetitors)
+  const [competitors, setCompetitors] = useState<Competitor[]>([]) // Initialize with empty array
   const [searchTerm, setSearchTerm] = useState("")
   const [selectedThreatLevel, setSelectedThreatLevel] = useState<string>("all")
+  const [combinedMarketShareState, setCombinedMarketShareState] = useState<number>(0);
+  const [combinedRevenueState, setCombinedRevenueState] = useState<string>("N/A");
+  const [isLoading, setIsLoading] = useState(true); // For loading state
+
+  const fetchCompetitorData = async () => {
+    setIsLoading(true);
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL || 'http://localhost:8000'}/competitors`);
+      if (!response.ok) {
+        console.error(`Failed to fetch competitor data: ${response.status} ${response.statusText}`);
+        setCompetitors([]); // Set to empty on error
+        return;
+      }
+      const responseData = await response.json();
+      const rawComps = responseData.data || [];
+
+      const transformedData: Competitor[] = rawComps.map((item: any, index: number) => {
+        let determinedThreat: "low" | "medium" | "high" = "medium";
+        const marketShareNum = parseFloat(item.market_share);
+        if (item.threat_level) {
+          determinedThreat = item.threat_level;
+        } else if (!isNaN(marketShareNum)) {
+          if (marketShareNum > 20) determinedThreat = "high";
+          else if (marketShareNum < 10) determinedThreat = "low";
+        }
+
+        // Attempt to parse revenue string like "$2.5B" or "€100M" to a number for potential sum later
+        let revenueNum = 0;
+        if (typeof item.revenue === 'string' || typeof item.financial_data?.[0]?.value === 'string') {
+            const revenueStr = item.revenue || item.financial_data?.[0]?.value || "";
+            const match = revenueStr.match(/([\$€]?)([0-9\.]+)([BMK]?)/i);
+            if (match) {
+                let numPart = parseFloat(match[2]);
+                const multiplier = match[3]?.toUpperCase();
+                if (multiplier === 'B') numPart *= 1e9;
+                else if (multiplier === 'M') numPart *= 1e6;
+                else if (multiplier === 'K') numPart *= 1e3;
+                revenueNum = numPart;
+            }
+        } else if (typeof item.revenue === 'number') {
+            revenueNum = item.revenue;
+        }
+
+
+        return {
+          id: item.id || item.company_name || item.name || item.title || `comp-${index}`,
+          name: item.company_name || item.name || item.title || "Unknown Competitor",
+          marketShare: !isNaN(marketShareNum) ? marketShareNum : 0,
+          revenue: item.revenue_string || item.revenue || (revenueNum ? `$${(revenueNum/1e9).toFixed(1)}B` : "N/A"), // Display formatted or original
+          employees: parseInt(item.employees || item.employee_count || item.number_of_employees) || 0,
+          growthRate: parseFloat(item.growth_rate || item.growth_rate_percentage) || 0,
+          strengths: Array.isArray(item.strengths) ? item.strengths : (typeof item.strengths === 'string' ? item.strengths.split(',').map(s => s.trim()) : []),
+          weaknesses: Array.isArray(item.weaknesses) ? item.weaknesses : (typeof item.weaknesses === 'string' ? item.weaknesses.split(',').map(s => s.trim()) : []),
+          recentActivity: item.recent_activity || item.summary || item.latest_news_summary || "N/A",
+          threat_level: determinedThreat,
+          // Store raw revenue number for sum if needed, or transform revenue to number directly if consistent
+          _revenueNumeric: revenueNum
+        };
+      });
+      setCompetitors(transformedData);
+
+      const totalMarketShare = transformedData.reduce((acc, comp) => acc + comp.marketShare, 0);
+      setCombinedMarketShareState(totalMarketShare);
+
+      const totalNumericRevenue = transformedData.reduce((acc, comp) => acc + (comp._revenueNumeric || 0), 0);
+        if (totalNumericRevenue > 0) {
+            if (totalNumericRevenue >= 1e9) {
+                setCombinedRevenueState(`$${(totalNumericRevenue / 1e9).toFixed(1)}B`);
+            } else if (totalNumericRevenue >= 1e6) {
+                setCombinedRevenueState(`$${(totalNumericRevenue / 1e6).toFixed(1)}M`);
+            } else {
+                setCombinedRevenueState(`$${totalNumericRevenue.toLocaleString()}`);
+            }
+        } else {
+            setCombinedRevenueState("N/A");
+        }
+
+    } catch (error) {
+      console.error("Failed to fetch or transform competitor data:", error);
+      setCompetitors([]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchCompetitorData();
+  }, []);
+
 
   const filteredCompetitors = competitors.filter((competitor) => {
     const matchesSearch = competitor.name.toLowerCase().includes(searchTerm.toLowerCase())
@@ -188,7 +215,7 @@ export default function CompetitorsPage() {
                   <BarChart3 className="w-6 h-6 text-neon-blue" />
                 </div>
                 <div>
-                  <p className="text-2xl font-bold text-white">64.6%</p>
+                  <p className="text-2xl font-bold text-white">{combinedMarketShareState.toFixed(1)}%</p>
                   <p className="text-sm text-gray-400">Combined Market Share</p>
                 </div>
               </div>
@@ -202,7 +229,7 @@ export default function CompetitorsPage() {
                   <DollarSign className="w-6 h-6 text-neon-purple" />
                 </div>
                 <div>
-                  <p className="text-2xl font-bold text-white">$8.7B</p>
+                  <p className="text-2xl font-bold text-white">{combinedRevenueState}</p>
                   <p className="text-sm text-gray-400">Combined Revenue</p>
                 </div>
               </div>
@@ -210,57 +237,7 @@ export default function CompetitorsPage() {
           </Card>
         </div>
 
-        {/* Competitor Comparison Chart */}
-        <Card className="bg-dark-card border-dark-border">
-          <CardHeader>
-            <CardTitle className="text-white flex items-center gap-2">
-              <BarChart3 className="w-5 h-5 text-neon-blue" />
-              Competitive Analysis Radar
-            </CardTitle>
-            <CardDescription className="text-gray-400">Compare key metrics across competitors</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ResponsiveContainer width="100%" height={400}>
-              <RadarChart data={competitorComparison}>
-                <PolarGrid stroke="#404040" />
-                <PolarAngleAxis dataKey="metric" tick={{ fill: "#9CA3AF", fontSize: 12 }} />
-                <PolarRadiusAxis angle={90} domain={[0, 100]} tick={{ fill: "#9CA3AF", fontSize: 10 }} />
-                <Radar
-                  name="Us"
-                  dataKey="us"
-                  stroke={chartColors[0]}
-                  fill={chartColors[0]}
-                  fillOpacity={0.1}
-                  strokeWidth={2}
-                />
-                <Radar
-                  name="TechCorp"
-                  dataKey="competitor1"
-                  stroke={chartColors[1]}
-                  fill={chartColors[1]}
-                  fillOpacity={0.1}
-                  strokeWidth={2}
-                />
-                <Radar
-                  name="FutureSoft"
-                  dataKey="competitor2"
-                  stroke={chartColors[2]}
-                  fill={chartColors[2]}
-                  fillOpacity={0.1}
-                  strokeWidth={2}
-                />
-                <RechartsTooltip
-                  contentStyle={{
-                    backgroundColor: "#2C2C2C",
-                    border: "1px solid #404040",
-                    borderRadius: "8px",
-                    color: "#fff",
-                  }}
-                />
-              </RadarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
+        {/* Competitor Comparison Chart - REMOVED */}
 
         {/* Competitors List */}
         <div className="grid gap-4">

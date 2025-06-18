@@ -6,6 +6,7 @@ import { SidebarProvider } from "@/components/ui/sidebar"
 import { AppSidebar } from "@/components/app-sidebar"
 import { Toaster } from "@/components/ui/toaster"
 import { ColorProvider } from "@/lib/color-context"
+import { AuthProvider } from "@/components/auth-provider"; // Add this import
 
 const inter = Inter({ subsets: ["latin"] })
 
@@ -23,15 +24,17 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <body className={`${inter.className} bg-dark-bg text-white antialiased`}>
-        <ColorProvider>
-          <SidebarProvider>
-            <div className="flex min-h-screen w-full">
-              <AppSidebar />
-              <main className="flex-1 bg-dark-bg">{children}</main>
-            </div>
-          </SidebarProvider>
-          <Toaster />
-        </ColorProvider>
+        <AuthProvider> {/* Add AuthProvider here */}
+          <ColorProvider>
+            <SidebarProvider>
+              <div className="flex min-h-screen w-full">
+                <AppSidebar />
+                <main className="flex-1 bg-dark-bg">{children}</main>
+              </div>
+            </SidebarProvider>
+            <Toaster />
+          </ColorProvider>
+        </AuthProvider> {/* Close AuthProvider here */}
       </body>
     </html>
   )
