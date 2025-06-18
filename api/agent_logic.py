@@ -25,9 +25,10 @@ try:
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain.text_splitter import RecursiveCharacterTextSplitter
     from langchain.chains import RetrievalQA
+    from supabase import create_client, Client as SupabaseClient # Added Supabase import
 except ImportError as e:
     print(f"Error importing LangChain libraries: {e}")
-    print("Please install required packages: pip install langchain langchain_core langgraph langchain_community")
+    print("Please install required packages: pip install langchain langchain_core langgraph langchain_community supabase") # Added supabase to pip install message
 
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -100,6 +101,41 @@ if "USER_AGENT" not in os.environ:
 load_dotenv()
 
 search_results_cache = TTLCache(maxsize=100, ttl=3600)
+
+# Global Supabase client instance
+_supabase_client_instance: Optional[SupabaseClient] = None
+
+def get_supabase_client() -> Optional[SupabaseClient]:
+    global _supabase_client_instance
+    if _supabase_client_instance:
+        return _supabase_client_instance
+
+    supabase_url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL")
+    # Prioritize SERVICE_ROLE_KEY, fall back to ANON_KEY for flexibility (e.g. client-side use)
+    supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+    if not supabase_key:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not found for agent_logic, falling back to SUPABASE_ANON_KEY.")
+        supabase_key = os.getenv("SUPABASE_ANON_KEY")
+
+    if supabase_url and supabase_key:
+        try:
+            # Log only a part of the URL that is not sensitive, e.g., the project ID part if present
+            # Example: "https://[project-id].supabase.co" -> log "project-id"
+            url_parts = supabase_url.split('//')
+            domain_part = url_parts[-1].split('.')[0] if len(url_parts) > 1 else "unknown_domain"
+            logger.info(f"Initializing Supabase client for agent_logic with URL domain: {domain_part}...")
+            _supabase_client_instance = create_client(supabase_url, supabase_key)
+            logger.info("Supabase client for agent_logic initialized successfully.")
+            return _supabase_client_instance
+        except Exception as e:
+            error_logger.error(f"Failed to initialize Supabase client in agent_logic: {e}\n{traceback.format_exc()}")
+            _supabase_client_instance = None
+            return None
+    else:
+        error_logger.error("SUPABASE_URL or a SUPABASE_KEY (SERVICE_ROLE or ANON) not found in environment for agent_logic.")
+        _supabase_client_instance = None
+        return None
 
 def get_api_key(service_name: str, user_id: Optional[str] = None) -> Optional[str]:
     logger.debug(f"Retrieving API key for service: {service_name}, UserID: {user_id if user_id else 'N/A'}")
@@ -592,6 +628,73 @@ def load_chat_history(session_id_val: str) -> List[Dict[str, Any]]:
     except Exception as e_load_chat:
         error_logger.error(f"Failed to load chat history for SessionID '{session_id_val}' from {db_path}: {e_load_chat}")
         return []
+
+def get_download_file_path(state_id: str, user_id: str, file_identifier: str) -> Optional[str]:
+    db_path = get_db_path()
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT state_data FROM states WHERE id = ? AND user_id = ?",
+            (state_id, user_id)
+        )
+        row = cursor.fetchone()
+        if not row:
+            logger.warning(f"File Download: State ID {state_id} not found or not owned by user {user_id}")
+            return None
+
+        state_data_json = row[0]
+        try:
+            state_data_dict = json.loads(state_data_json)
+        except json.JSONDecodeError:
+            error_logger.error(f"File Download: Failed to parse state_data for state {state_id}")
+            return None
+
+        target_path = None
+
+        agent_download_files = state_data_dict.get("download_files", {})
+        if isinstance(agent_download_files, dict) and file_identifier in agent_download_files:
+            target_path = agent_download_files[file_identifier]
+
+        if not target_path:
+            agent_chart_paths = state_data_dict.get("chart_paths", [])
+            if isinstance(agent_chart_paths, list):
+                for chart_path in agent_chart_paths:
+                    if chart_path and isinstance(chart_path, str) and os.path.basename(chart_path) == file_identifier:
+                        target_path = chart_path
+                        break
+
+        if not target_path or not isinstance(target_path, str):
+            logger.warning(f"File Download: File identifier '{file_identifier}' not found in state {state_id} for user {user_id}.")
+            return None
+
+        reports_base_dir = os.path.abspath(get_agent_base_reports_dir())
+        if not isinstance(target_path, str):
+             error_logger.error(f"File Download: target_path is not a string for state {state_id}, identifier {file_identifier}.")
+             return None
+        resolved_target_path = os.path.abspath(target_path)
+
+        if not resolved_target_path.startswith(reports_base_dir):
+            error_logger.error(f"File Download SECURITY ALERT: Attempt to access path '{resolved_target_path}' outside base reports directory '{reports_base_dir}' for state {state_id}, user {user_id}.")
+            return None
+
+        if not os.path.exists(resolved_target_path) or not os.path.isfile(resolved_target_path):
+            error_logger.error(f"File Download: File does not exist or is not a file at path '{resolved_target_path}' for state {state_id}, user {user_id}.")
+            return None
+
+        logger.info(f"File Download: Access validated for path '{resolved_target_path}' for state {state_id}, user {user_id}.")
+        return resolved_target_path
+
+    except sqlite3.Error as e:
+        error_logger.error(f"File Download: SQLite error for state {state_id}, user {user_id}: {e}")
+        return None
+    except Exception as e:
+        error_logger.error(f"File Download: Unexpected error for state {state_id}, user {user_id}: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=8))
 def search_with_tavily(search_query: str) -> List[str]:
