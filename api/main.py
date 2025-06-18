@@ -110,6 +110,9 @@ class StateDownloadsResponse(BaseModel):
     created_at: str
     files: List[DownloadableFile]
 
+class UpdateProfileRequest(BaseModel): # Already added in previous attempt, ensuring it's here or correctly placed
+    full_name: str
+
 # --- Authentication Dependency ---
 class SupabaseUser(BaseModel):
     id: str
@@ -861,6 +864,63 @@ async def download_analysis_file(
     except Exception as e:
         logger.error(f"Error processing download for file '{file_identifier}', state {state_id}, user {current_user.id}: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Could not process file download.")
+
+@app.put("/users/me/profile")
+async def update_user_profile(
+    profile_update: UpdateProfileRequest,
+    current_user: Annotated[SupabaseUser, Depends(get_current_user)]
+):
+    supabase = get_supabase_client()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase client not available.")
+
+    try:
+        # Update auth.users table (user_metadata.full_name)
+        auth_update_response = await run_in_threadpool(
+            supabase.auth.update_user,
+            attributes={'data': {'full_name': profile_update.full_name}}
+        )
+        updated_auth_user = auth_update_response.user
+        if not updated_auth_user:
+             raise HTTPException(status_code=500, detail="Failed to update user profile in auth schema (no user returned).")
+
+        # Update public.users table
+        def _update_public_user_table():
+            return (
+                supabase.table("users")
+                .update({
+                    "name": profile_update.full_name,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })
+                .eq("id", str(current_user.id)) # Ensure current_user.id is string for eq
+                .execute()
+            )
+        public_users_update_response = await run_in_threadpool(_update_public_user_table)
+
+        if hasattr(public_users_update_response, 'error') and public_users_update_response.error:
+            error_logger.error(f"Error updating public.users for UserID {current_user.id}: {public_users_update_response.error}")
+        elif hasattr(public_users_update_response, 'data') and not public_users_update_response.data:
+            error_logger.warning(f"No rows updated in public.users for UserID {current_user.id}. User might not exist in public.users or name was the same.")
+
+        logger.info(f"User profile updated for UserID: {current_user.id}. New name: {profile_update.full_name}")
+
+        auth_user_full_name = ""
+        if updated_auth_user.user_metadata and isinstance(updated_auth_user.user_metadata, dict):
+            auth_user_full_name = updated_auth_user.user_metadata.get('full_name', '')
+
+        return {
+            "message": "Profile updated successfully",
+            "updated_user_details": {
+                "full_name": auth_user_full_name,
+                "email": updated_auth_user.email
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_logger.error(f"Error updating profile for UserID {current_user.id}: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"An unexpected error occurred while updating profile: {str(e)}")
 
 @app.put("/users/me/profile")
 async def update_user_profile(
