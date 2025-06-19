@@ -1,29 +1,33 @@
-"use client"
 
-import type React from "react"
+'use client'
 
-import { useEffect } from "react"
-import { useRouter } from "next/navigation"
-import { useAuth } from "./auth-provider"
+import { useAuth } from './auth-provider'
+import { useRouter } from 'next/navigation'
+import { useEffect } from 'react'
 
 interface ProtectedRouteProps {
   children: React.ReactNode
 }
 
 export function ProtectedRoute({ children }: ProtectedRouteProps) {
-  const { user, loading } = useAuth()
+  const { user, loading, isConfigured } = useAuth()
   const router = useRouter()
 
   useEffect(() => {
-    if (!loading && !user) {
-      router.push("/login")
+    if (!loading && isConfigured && !user) {
+      router.push('/login')
     }
-  }, [user, loading, router])
+  }, [user, loading, router, isConfigured])
+
+  // If Supabase is not configured, allow access
+  if (!isConfigured) {
+    return <>{children}</>
+  }
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-dark-bg flex items-center justify-center">
-        <div className="text-white">Loading...</div>
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-gray-900"></div>
       </div>
     )
   }
