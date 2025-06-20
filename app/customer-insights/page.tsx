@@ -4,6 +4,7 @@ import { useState, useEffect } from "react" // Added useEffect
 import { Users, TrendingUp, Target, Heart, UserCheck, Download } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
+import { useToast } from "@/hooks/use-toast" // Added useToast import
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
@@ -31,6 +32,7 @@ export default function CustomerInsightsPage() {
   const chartColors = getChartColors()
   const [insights, setInsights] = useState<CustomerSegment[]>([]) // Initialize with empty array
   const [loading, setLoading] = useState(true) // Start with loading true
+  const { toast } = useToast(); // Initialize useToast
 
   const fetchCustomerInsightsData = async () => {
     setLoading(true);
@@ -114,6 +116,33 @@ export default function CustomerInsightsPage() {
     )
   }
 
+  const handleExportInsights = () => {
+    if (!insights || insights.length === 0) {
+      toast({
+        title: "No Data",
+        description: "No customer insights data to export.",
+        variant: "default",
+      });
+      return;
+    }
+
+    const jsonString = JSON.stringify(insights, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'customer_insights.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    toast({
+      title: "Export Successful",
+      description: "Customer insights exported to customer_insights.json",
+    });
+  };
+
   if (loading) {
     return (
       <SidebarInset className="bg-dark-bg">
@@ -148,7 +177,11 @@ export default function CustomerInsightsPage() {
           <h1 className="text-lg font-semibold text-white">Customer Insights</h1>
         </div>
         <div className="ml-auto">
-          <Button variant="outline" className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10">
+          <Button
+            variant="outline"
+            className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10"
+            onClick={handleExportInsights}
+          >
             <Download className="w-4 h-4 mr-2" />
             Export Insights
           </Button>
@@ -296,10 +329,17 @@ export default function CustomerInsightsPage() {
         </div>
 
         {/* Detailed Segments */}
-        <div className="grid gap-6">
-          {insights.map((segment, index) => (
-            <Card key={segment.segment_name} className="bg-dark-card border-dark-border">
-              <CardHeader>
+        {!loading && insights.length === 0 ? (
+          <Card className="bg-dark-card border-dark-border">
+            <CardContent className="p-6 text-center text-gray-400">
+              No customer segments data available.
+            </CardContent>
+          </Card>
+        ) : (
+          <div className="grid gap-6">
+            {insights.map((segment, index) => (
+              <Card key={segment.segment_name} className="bg-dark-card border-dark-border">
+                <CardHeader>
                 <div className="flex items-start justify-between">
                   <div>
                     <CardTitle className="text-white flex items-center gap-2">
@@ -375,8 +415,9 @@ export default function CustomerInsightsPage() {
                 </div>
               </CardContent>
             </Card>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
     </SidebarInset>
   )

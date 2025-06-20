@@ -76,6 +76,13 @@ export default function DashboardPage() {
   const [analysisQuestion, setAnalysisQuestion] = useState("");
   const [isGeneratingReport, setIsGeneratingReport] = useState(false);
 
+  // State for AI Insights Dialog
+  const [isAiInsightsDialogOpen, setIsAiInsightsDialogOpen] = useState(false);
+  const [aiInsightsQuery, setAiInsightsQuery] = useState("");
+  const [aiInsightsMarketDomain, setAiInsightsMarketDomain] = useState("");
+  const [aiInsightsSpecificQuestion, setAiInsightsSpecificQuestion] = useState("");
+  const [isGeneratingAiInsights, setIsGeneratingAiInsights] = useState(false);
+
   const { toast } = useToast();
 
   const kpiIconsList = [TrendingUp, Users, Heart, PieChart, DollarSign, Briefcase, Activity, Target];
@@ -259,6 +266,89 @@ export default function DashboardPage() {
     }
   };
 
+  const handleGetAiInsights = async () => {
+    if (!aiInsightsQuery.trim() || !aiInsightsMarketDomain.trim()) {
+      toast({
+        title: "Validation Error",
+        description: "Query and Market Domain are required for AI Insights.",
+        variant: "destructive",
+      });
+      return;
+    }
+    setIsGeneratingAiInsights(true);
+    try {
+      const response = await fetch('/api/analysis', { // Assuming the same endpoint for now
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query_str: aiInsightsQuery,
+          market_domain_str: aiInsightsMarketDomain,
+          question_str: aiInsightsSpecificQuestion || "", // Pass empty string if not provided
+        }),
+      });
+
+      const result = await response.json();
+
+      if (!response.ok || result.error || !result.success) {
+        throw new Error(result.error || result.message || 'Failed to get AI insights');
+      }
+
+      toast({
+        title: "AI Insights Request Submitted",
+        description: `Your request for "${aiInsightsQuery}" is being processed. State ID: ${result.data?.state_id || result.state_id}`,
+      });
+      setIsAiInsightsDialogOpen(false);
+      // Clear form fields
+      setAiInsightsQuery("");
+      setAiInsightsMarketDomain("");
+      setAiInsightsSpecificQuestion("");
+    } catch (error: any) {
+      toast({
+        title: "Error Generating AI Insights",
+        description: error.message || "An unexpected error occurred.",
+        variant: "destructive",
+      });
+    } finally {
+      setIsGeneratingAiInsights(false);
+    }
+  };
+
+  const handleExportKpiData = () => {
+    if (!kpiData || kpiData.length === 0) {
+      toast({
+        title: "No Data",
+        description: "No KPI data to export.",
+        variant: "default", // Or "destructive" if preferred
+      });
+      return;
+    }
+
+    const cleanedKpiData = kpiData.map(kpi => ({
+      title: kpi.title,
+      value: kpi.value,
+      unit: kpi.unit,
+      change: kpi.change,
+      color: kpi.color,
+      // Omit 'icon' as it's a React component
+    }));
+
+    const jsonString = JSON.stringify(cleanedKpiData, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'kpi_data.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    toast({
+      title: "Export Successful",
+      description: "KPI data exported to kpi_data.json",
+    });
+  };
+
   return (
     <SidebarInset className="bg-dark-bg">
       {/* Header */}
@@ -284,11 +374,29 @@ export default function DashboardPage() {
       {/* Main Content */}
       <div className="flex flex-1 flex-col gap-6 p-6">
         {/* KPI Cards */}
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {kpiData.map((kpi, index) => (
-            <KPICard key={index} {...kpi} />
-          ))}
-        </div>
+        {isRefreshing && kpiData.length === 0 ? (
+          <div className="md:col-span-2 lg:col-span-4">
+            <Card className="bg-dark-card border-dark-border">
+              <CardContent className="p-6 text-center text-gray-400">
+                Loading KPI data...
+              </CardContent>
+            </Card>
+          </div>
+        ) : !isRefreshing && kpiData.length === 0 ? (
+          <div className="md:col-span-2 lg:col-span-4">
+            <Card className="bg-dark-card border-dark-border">
+              <CardContent className="p-6 text-center text-gray-400">
+                No KPI data available.
+              </CardContent>
+            </Card>
+          </div>
+        ) : (
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+            {kpiData.map((kpi, index) => (
+              <KPICard key={kpi.title || index} {...kpi} />
+            ))}
+          </div>
+        )}
 
         {/* Charts Section */}
         <div className="grid gap-6 md:grid-cols-2">
@@ -417,7 +525,10 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
 
-          <Card className="bg-dark-card border-dark-border hover:border-neon-green/50 transition-all duration-300 cursor-pointer group">
+          <Card
+            className="bg-dark-card border-dark-border hover:border-neon-green/50 transition-all duration-300 cursor-pointer group"
+            onClick={() => setIsAiInsightsDialogOpen(true)}
+          >
             <CardContent className="p-6">
               <div className="flex items-center gap-4">
                 <div className="p-3 rounded-lg bg-neon-green/20 group-hover:bg-neon-green/30 transition-colors">
@@ -431,7 +542,10 @@ export default function DashboardPage() {
             </CardContent>
           </Card>
 
-          <Card className="bg-dark-card border-dark-border hover:border-neon-pink/50 transition-all duration-300 cursor-pointer group">
+          <Card
+            className="bg-dark-card border-dark-border hover:border-neon-pink/50 transition-all duration-300 cursor-pointer group"
+            onClick={handleExportKpiData}
+          >
             <CardContent className="p-6">
               <div className="flex items-center gap-4">
                 <div className="p-3 rounded-lg bg-neon-pink/20 group-hover:bg-neon-pink/30 transition-colors">
@@ -494,6 +608,58 @@ export default function DashboardPage() {
             </DialogClose>
             <Button onClick={handleGenerateReport} disabled={isGeneratingReport} className="bg-neon-blue hover:bg-neon-blue/90 text-white">
               {isGeneratingReport ? "Generating..." : "Generate Analysis"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* AI Insights Dialog */}
+      <Dialog open={isAiInsightsDialogOpen} onOpenChange={setIsAiInsightsDialogOpen}>
+        <DialogContent className="bg-dark-card border-dark-border text-white sm:max-w-[525px]">
+          <DialogHeader>
+            <DialogTitle className="text-neon-green">Get AI-Powered Insights</DialogTitle>
+            <DialogDescription>
+              Describe your area of interest to receive AI-powered recommendations and insights.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-4">
+            <div className="grid items-center grid-cols-4 gap-4">
+              <Label htmlFor="aiInsightsQueryDialog" className="text-right col-span-1">Query*</Label>
+              <Input
+                id="aiInsightsQueryDialog"
+                value={aiInsightsQuery}
+                onChange={(e) => setAiInsightsQuery(e.target.value)}
+                placeholder="e.g., Future of remote work"
+                className="col-span-3 bg-dark-bg border-dark-border placeholder:text-gray-500"
+              />
+            </div>
+            <div className="grid items-center grid-cols-4 gap-4">
+              <Label htmlFor="aiInsightsMarketDomainDialog" className="text-right col-span-1">Market Domain*</Label>
+              <Input
+                id="aiInsightsMarketDomainDialog"
+                value={aiInsightsMarketDomain}
+                onChange={(e) => setAiInsightsMarketDomain(e.target.value)}
+                placeholder="e.g., Human Resources, SaaS"
+                className="col-span-3 bg-dark-bg border-dark-border placeholder:text-gray-500"
+              />
+            </div>
+            <div className="grid items-center grid-cols-4 gap-4">
+              <Label htmlFor="aiInsightsSpecificQuestionDialog" className="text-right col-span-1">Specific Question (Optional)</Label>
+              <Input
+                id="aiInsightsSpecificQuestionDialog"
+                value={aiInsightsSpecificQuestion}
+                onChange={(e) => setAiInsightsSpecificQuestion(e.target.value)}
+                placeholder="e.g., What are emerging collaboration tools?"
+                className="col-span-3 bg-dark-bg border-dark-border placeholder:text-gray-500"
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <DialogClose asChild>
+              <Button variant="outline" className="border-gray-600 text-gray-300 hover:bg-dark-bg hover:text-white">Cancel</Button>
+            </DialogClose>
+            <Button onClick={handleGetAiInsights} disabled={isGeneratingAiInsights} className="bg-neon-green hover:bg-neon-green/90 text-black">
+              {isGeneratingAiInsights ? "Generating Insights..." : "Get Insights"}
             </Button>
           </DialogFooter>
         </DialogContent>

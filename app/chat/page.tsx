@@ -10,7 +10,7 @@ import { Separator } from "@/components/ui/separator";
 
 interface ChatMessage {
   id: string;
-  type: 'user' | 'ai' | 'error';
+  role: 'user' | 'assistant' | 'error'; // Updated to role
   text: string;
 }
 
@@ -43,32 +43,42 @@ export default function ChatPage() {
 
     const userMessageText = currentMessage;
     // Add user message to UI optimistically
-    setMessages(prev => [...prev, { type: 'user', text: userMessageText, id: Date.now().toString() }]);
+    setMessages(prev => [...prev, { role: 'user', text: userMessageText, id: Date.now().toString() }]);
     setCurrentMessage(''); // Clear input field
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/chat', { // This is the Next.js API route
+      // Prepare messages for the API
+      const messagesForApi = [];
+      const lastMessageFromState = messages.length > 0 ? messages[messages.length - 1] : null;
+
+      // Add last assistant message if it exists (and was not an error message)
+      if (lastMessageFromState && lastMessageFromState.role === 'assistant') {
+        messagesForApi.push({ role: 'assistant', content: lastMessageFromState.text });
+      }
+      // Add current user message
+      messagesForApi.push({ role: 'user', content: userMessageText });
+
+      const payload = {
+        messages: messagesForApi,
+        context: { session_id: sessionId }
+      };
+
+      const response = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        // The Next.js route /api/chat will pass this to the Python backend
-        // It includes session_id for context, and potentially history if implemented
-        body: JSON.stringify({ message: userMessageText, session_id: sessionId }),
+        body: JSON.stringify(payload),
       });
 
-      // The /api/chat/route.ts directly returns the Python API's response:
-      // { success: bool, response: str, session_id: str, timestamp: str } or { error: str }
       const result = await response.json();
 
       if (!response.ok || result.error || (result.success !== undefined && !result.success)) {
         const errorMsg = result.error || (result.data ? result.data.response : 'Failed to get response from AI.');
         throw new Error(errorMsg);
       }
-      // Assuming result directly contains the Python API's response structure
-      // (as per current /api/chat/route.ts which passes through Python response)
-      setMessages(prev => [...prev, { type: 'ai', text: result.response, id: Date.now().toString() + 'ai' }]);
+      setMessages(prev => [...prev, { role: 'assistant', text: result.response, id: Date.now().toString() + 'ai' }]);
     } catch (error: any) {
-      setMessages(prev => [...prev, { type: 'error', text: `Error: ${error.message}`, id: Date.now().toString() + 'err' }]);
+      setMessages(prev => [...prev, { role: 'error', text: `Error: ${error.message}`, id: Date.now().toString() + 'err' }]);
       toast({ title: "Chat Error", description: error.message, variant: "destructive" });
     } finally {
       setIsLoading(false);
@@ -89,9 +99,9 @@ export default function ChatPage() {
       <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-dark-bg">
         {messages.map(msg => (
           <Card key={msg.id} className={`max-w-xl p-3 rounded-lg ${
-            msg.type === 'user' ? 'ml-auto bg-neon-blue/20 border-neon-blue/50 text-white' :
-            msg.type === 'ai' ? 'mr-auto bg-dark-card border-dark-border text-white' :
-            'mr-auto bg-red-500/20 border-red-500/50 text-red-200' // Error message styling
+            msg.role === 'user' ? 'ml-auto bg-neon-blue/20 border-neon-blue/50 text-white' :
+            msg.role === 'assistant' ? 'mr-auto bg-dark-card border-dark-border text-white' :
+            'mr-auto bg-red-500/20 border-red-500/50 text-red-200' // Error message styling for msg.role === 'error'
           }`}>
             <p className="text-white whitespace-pre-wrap">{msg.text}</p>
           </Card>

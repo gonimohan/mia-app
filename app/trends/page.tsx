@@ -1,9 +1,11 @@
 "use client"
 
 import { useState, useEffect } from "react" // Added useEffect
+import { useRouter } from "next/navigation" // Import useRouter
 import { TrendingUp, Calendar, Target, Zap, ArrowUp, ArrowDown, Minus, Download } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
+import { useToast } from "@/hooks/use-toast" // Import useToast
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { Badge } from "@/components/ui/badge"
@@ -33,6 +35,8 @@ export default function TrendsPage() {
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [selectedCategory, setSelectedCategory] = useState<string>("all")
   const [selectedTimeframe, setSelectedTimeframe] = useState<string>("all")
+  const { toast } = useToast(); // Initialize useToast
+  const router = useRouter(); // Initialize useRouter
 
   const fetchTrendsData = async () => {
     setIsLoading(true);
@@ -119,6 +123,43 @@ export default function TrendsPage() {
     )
   }
 
+  const handleExportTrends = () => {
+    if (!filteredTrends || filteredTrends.length === 0) {
+      toast({
+        title: "No Data",
+        description: "No trends data to export for the current filters.",
+        variant: "default",
+      });
+      return;
+    }
+
+    const jsonString = JSON.stringify(filteredTrends, null, 2);
+    const blob = new Blob([jsonString], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'market_trends.json';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+
+    toast({
+      title: "Export Successful",
+      description: "Market trends exported to market_trends.json",
+    });
+  };
+
+  const handleAnalyzeTrend = (trend: Trend) => {
+    localStorage.setItem("analyzeTrendName", trend.name);
+    localStorage.setItem("analyzeTrendContext", trend.category); // Using category as context
+    toast({
+      title: "Preparing Analysis",
+      description: `Redirecting to dashboard. Context set for '${trend.name}'.`,
+    });
+    router.push("/dashboard");
+  };
+
   return (
     <SidebarInset className="bg-dark-bg">
       {/* Header */}
@@ -155,7 +196,11 @@ export default function TrendsPage() {
             </SelectContent>
           </Select>
 
-          <Button variant="outline" className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10">
+          <Button
+            variant="outline"
+            className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10"
+            onClick={handleExportTrends}
+          >
             <Download className="w-4 h-4 mr-2" />
             Export
           </Button>
@@ -167,13 +212,20 @@ export default function TrendsPage() {
         {/* Overview Chart - REMOVED */}
 
         {/* Trends Grid */}
-        <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3"> {/* Adjusted for potentially more cards */}
-          {filteredTrends.map((trend) => (
-            <Card
-              key={trend.id}
-              className="bg-dark-card border-dark-border hover:border-opacity-50 transition-all duration-300"
-            >
-              <CardHeader>
+        {isLoading ? (
+          <Card className="bg-dark-card border-dark-border">
+            <CardContent className="p-6 text-center text-gray-400">
+              Loading trends list...
+            </CardContent>
+          </Card>
+        ) : filteredTrends.length > 0 ? (
+          <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3"> {/* Adjusted for potentially more cards */}
+            {filteredTrends.map((trend) => (
+              <Card
+                key={trend.id}
+                className="bg-dark-card border-dark-border hover:border-opacity-50 transition-all duration-300"
+              >
+                <CardHeader>
                 <div className="flex items-start justify-between">
                   <div className="space-y-2">
                     <CardTitle className="text-white flex items-center gap-2">
@@ -218,6 +270,7 @@ export default function TrendsPage() {
                     variant="ghost"
                     size="sm"
                     className="text-neon-blue hover:text-neon-blue hover:bg-neon-blue/10"
+                    onClick={() => handleAnalyzeTrend(trend)}
                   >
                     <Target className="w-3 h-3 mr-1" />
                     Analyze
@@ -225,8 +278,15 @@ export default function TrendsPage() {
                 </div>
               </CardContent>
             </Card>
-          ))}
-        </div>
+            ))}
+          </div>
+        ) : (
+          <Card className="bg-dark-card border-dark-border">
+            <CardContent className="p-6 text-center text-gray-400">
+              No trends found matching your criteria.
+            </CardContent>
+          </Card>
+        )}
 
         {/* Quick Insights */}
         <div className="grid gap-4 md:grid-cols-3">

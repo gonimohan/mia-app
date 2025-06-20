@@ -95,6 +95,12 @@ export default function SettingsPage() {
     setDisplayName(initialDisplayName); // Revert to initial name
   };
 
+  const handleClearCache = () => {
+    toast({
+      title: "Cache Cleared (Simulated)",
+      description: "This is a placeholder. Full cache clearing functionality will be implemented later.",
+    });
+  };
 
   if (isPageLoading) {
     return (
@@ -322,7 +328,11 @@ export default function SettingsPage() {
                 </div>
 
                 <div className="pt-4 border-t border-dark-border">
-                  <Button variant="outline" className="border-neon-pink/50 text-neon-pink hover:bg-neon-pink/10">
+                  <Button
+                    variant="outline"
+                    className="border-neon-pink/50 text-neon-pink hover:bg-neon-pink/10"
+                    onClick={handleClearCache}
+                  >
                     Clear All Cache
                   </Button>
                 </div>
