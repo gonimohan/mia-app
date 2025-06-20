@@ -1,25 +1,19 @@
-
+import type React from "react"
 import type { Metadata } from "next"
 import { Inter } from "next/font/google"
 import "./globals.css"
-import { ThemeProvider } from "@/components/theme-provider"
-import { AuthProvider } from "@/components/auth-provider"
+import { SidebarProvider } from "@/components/ui/sidebar"
+import { AppSidebar } from "@/components/app-sidebar"
 import { Toaster } from "@/components/ui/toaster"
 import { ColorProvider } from "@/lib/color-context"
+import { AuthProvider } from "@/components/auth-provider"
 
 const inter = Inter({ subsets: ["latin"] })
 
 export const metadata: Metadata = {
-  title: "Market Intelligence Dashboard",
-  description: "Advanced market intelligence and analytics platform",
-}
-
-function ErrorBoundary({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="error-boundary">
-      {children}
-    </div>
-  )
+  title: "Market Intel - Gen Z Dashboard",
+  description: "Modern Market Intelligence Dashboard with neon aesthetics",
+  generator: "v0.dev",
 }
 
 export default function RootLayout({
@@ -28,23 +22,19 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={inter.className}>
-        <ErrorBoundary>
-          <ThemeProvider
-            attribute="class"
-            defaultTheme="system"
-            enableSystem
-            disableTransitionOnChange
-          >
-            <ColorProvider>
-              <AuthProvider>
-                {children}
-                <Toaster />
-              </AuthProvider>
-            </ColorProvider>
-          </ThemeProvider>
-        </ErrorBoundary>
+    <html lang="en" className="dark">
+      <body className={`${inter.className} bg-dark-bg text-white antialiased`}>
+        <ColorProvider>
+          <AuthProvider>
+            <SidebarProvider>
+              <div className="flex min-h-screen w-full">
+                <AppSidebar />
+                <main className="flex-1 bg-dark-bg">{children}</main>
+              </div>
+            </SidebarProvider>
+            <Toaster />
+          </AuthProvider>
+        </ColorProvider>
       </body>
     </html>
   )

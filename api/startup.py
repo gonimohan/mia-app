@@ -1,8 +1,3 @@
-#!/usr/bin/env python3
-"""
-Startup script for the Market Intelligence Agent API
-"""
-
 import os
 import sys
 import logging
@@ -15,7 +10,11 @@ sys.path.insert(0, str(current_dir))
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s [%(levelname)s] %(name)s - %(message)s',
+    handlers=[
+        logging.FileHandler('startup.log'),
+        logging.StreamHandler()
+    ]
 )
 
 logger = logging.getLogger(__name__)
@@ -23,13 +22,11 @@ logger = logging.getLogger(__name__)
 def check_environment():
     """Check if all required environment variables are set"""
     required_vars = [
-        "NEWS_API_KEY",
-        "MEDIASTACK_API_KEY", 
-        "GNEWS_API_KEY",
-        "ALPHA_VANTAGE_API_KEY",
-        "FINANCIAL_MODELING_PREP_API_KEY",
-        "SERPAPI_API_KEY",
-        "TAVILY_API_KEY"
+        'SUPABASE_URL',
+        'SUPABASE_ANON_KEY',
+        'GOOGLE_API_KEY',
+        'NEWS_API_KEY',
+        'TAVILY_API_KEY'
     ]
     
     missing_vars = []
@@ -39,31 +36,65 @@ def check_environment():
     
     if missing_vars:
         logger.warning(f"Missing environment variables: {', '.join(missing_vars)}")
-        logger.info("The API will still work but with limited functionality")
-    else:
-        logger.info("All environment variables are configured")
+        return False
+    
+    logger.info("All required environment variables are set")
+    return True
 
-def main():
-    """Main startup function"""
+def initialize_database():
+    """Initialize the SQLite database"""
+    try:
+        from agent_logic import init_db
+        init_db()
+        logger.info("Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to initialize database: {e}")
+        return False
+
+def test_api_connections():
+    """Test connections to external APIs"""
+    try:
+        from test_api_keys import test_all_apis
+        results = test_all_apis()
+        
+        working_apis = sum(1 for result in results.values() if result)
+        total_apis = len(results)
+        
+        logger.info(f"API Connection Test: {working_apis}/{total_apis} APIs working")
+        
+        for api, status in results.items():
+            if status:
+                logger.info(f"✅ {api}: Connected")
+            else:
+                logger.warning(f"❌ {api}: Failed")
+        
+        return working_apis > 0
+    except Exception as e:
+        logger.error(f"Failed to test API connections: {e}")
+        return False
+
+def startup_checks():
+    """Run all startup checks"""
     logger.info("Starting Market Intelligence Agent API...")
     
     # Check environment
-    check_environment()
+    env_ok = check_environment()
     
-    # Import and run the FastAPI app
-    try:
-        from main import app
-        import uvicorn
-        
-        port = int(os.getenv("PORT", 8000))
-        host = os.getenv("HOST", "0.0.0.0")
-        
-        logger.info(f"Starting server on {host}:{port}")
-        uvicorn.run(app, host=host, port=port, reload=True)
-        
-    except Exception as e:
-        logger.error(f"Failed to start server: {str(e)}")
-        sys.exit(1)
+    # Initialize database
+    db_ok = initialize_database()
+    
+    # Test API connections
+    api_ok = test_api_connections()
+    
+    if env_ok and db_ok:
+        logger.info("✅ Startup checks completed successfully")
+        if not api_ok:
+            logger.warning("⚠️  Some APIs may not be working, but the service will start")
+        return True
+    else:
+        logger.error("❌ Startup checks failed")
+        return False
 
 if __name__ == "__main__":
-    main()
+    startup_checks()

@@ -1,113 +1,176 @@
 import os
-import asyncio
-import aiohttp
-from dotenv import load_dotenv
+import requests
+import logging
+from typing import Dict, bool
 
-# Load environment variables
-load_dotenv()
+logger = logging.getLogger(__name__)
 
-async def test_api_key(name, url, headers=None, params=None):
-    """Test if an API key is working"""
+def test_news_api() -> bool:
+    """Test News API connection"""
+    api_key = os.getenv("NEWS_API_KEY")
+    if not api_key:
+        return False
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, timeout=10) as response:
-                if response.status == 200:
-                    print(f"✅ {name}: API key is working")
-                    return True
-                else:
-                    print(f"❌ {name}: API key failed (Status: {response.status})")
-                    return False
+        response = requests.get(
+            "https://newsapi.org/v2/top-headlines",
+            params={"country": "us", "pageSize": 1, "apiKey": api_key},
+            timeout=10
+        )
+        return response.status_code == 200
     except Exception as e:
-        print(f"❌ {name}: Connection failed - {str(e)}")
+        logger.error(f"News API test failed: {e}")
         return False
 
-async def test_all_apis():
-    """Test all API keys"""
-    print("🔑 Testing API Keys...\n")
+def test_mediastack_api() -> bool:
+    """Test MediaStack API connection"""
+    api_key = os.getenv("MEDIASTACK_API_KEY")
+    if not api_key:
+        return False
     
-    results = {}
-    
-    # Test NewsAPI
-    if os.getenv("NEWS_API_KEY"):
-        results["NewsAPI"] = await test_api_key(
-            "NewsAPI",
-            "https://newsapi.org/v2/top-headlines",
-            params={"country": "us", "pageSize": 1, "apiKey": os.getenv("NEWS_API_KEY")}
-        )
-    else:
-        print("⚠️  NewsAPI: No API key found")
-    
-    # Test MediaStack
-    if os.getenv("MEDIASTACK_API_KEY"):
-        results["MediaStack"] = await test_api_key(
-            "MediaStack",
+    try:
+        response = requests.get(
             "http://api.mediastack.com/v1/news",
-            params={"access_key": os.getenv("MEDIASTACK_API_KEY"), "limit": 1}
+            params={"access_key": api_key, "limit": 1},
+            timeout=10
         )
-    else:
-        print("⚠️  MediaStack: No API key found")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"MediaStack API test failed: {e}")
+        return False
+
+def test_tavily_api() -> bool:
+    """Test Tavily API connection"""
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return False
     
-    # Test GNews
-    if os.getenv("GNEWS_API_KEY"):
-        results["GNews"] = await test_api_key(
-            "GNews",
-            "https://gnews.io/api/v4/top-headlines",
-            params={"token": os.getenv("GNEWS_API_KEY"), "lang": "en", "max": 1}
+    try:
+        response = requests.post(
+            "https://api.tavily.com/search",
+            json={
+                "api_key": api_key,
+                "query": "test",
+                "max_results": 1
+            },
+            timeout=10
         )
-    else:
-        print("⚠️  GNews: No API key found")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Tavily API test failed: {e}")
+        return False
+
+def test_serpapi() -> bool:
+    """Test SerpAPI connection"""
+    api_key = os.getenv("SERPAPI_API_KEY")
+    if not api_key:
+        return False
     
-    # Test Alpha Vantage
-    if os.getenv("ALPHA_VANTAGE_API_KEY"):
-        results["Alpha Vantage"] = await test_api_key(
-            "Alpha Vantage",
+    try:
+        response = requests.get(
+            "https://serpapi.com/search",
+            params={
+                "q": "test",
+                "api_key": api_key,
+                "engine": "google",
+                "num": 1
+            },
+            timeout=10
+        )
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"SerpAPI test failed: {e}")
+        return False
+
+def test_alpha_vantage() -> bool:
+    """Test Alpha Vantage API connection"""
+    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    if not api_key:
+        return False
+    
+    try:
+        response = requests.get(
             "https://www.alphavantage.co/query",
             params={
                 "function": "GLOBAL_QUOTE",
                 "symbol": "AAPL",
-                "apikey": os.getenv("ALPHA_VANTAGE_API_KEY")
-            }
+                "apikey": api_key
+            },
+            timeout=10
         )
-    else:
-        print("⚠️  Alpha Vantage: No API key found")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Alpha Vantage API test failed: {e}")
+        return False
+
+def test_google_gemini() -> bool:
+    """Test Google Gemini API connection"""
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        return False
     
-    # Test Financial Modeling Prep
-    if os.getenv("FINANCIAL_MODELING_PREP_API_KEY"):
-        results["Financial Modeling Prep"] = await test_api_key(
-            "Financial Modeling Prep",
-            f"https://financialmodelingprep.com/api/v3/quote/AAPL",
-            params={"apikey": os.getenv("FINANCIAL_MODELING_PREP_API_KEY")}
+    try:
+        # Simple test to check if the API key is valid
+        response = requests.get(
+            f"https://generativelanguage.googleapis.com/v1/models?key={api_key}",
+            timeout=10
         )
-    else:
-        print("⚠️  Financial Modeling Prep: No API key found")
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Google Gemini API test failed: {e}")
+        return False
+
+def test_supabase() -> bool:
+    """Test Supabase connection"""
+    url = os.getenv("SUPABASE_URL")
+    key = os.getenv("SUPABASE_ANON_KEY")
     
-    # Test SerpAPI
-    if os.getenv("SERPAPI_API_KEY"):
-        results["SerpAPI"] = await test_api_key(
-            "SerpAPI",
-            "https://serpapi.com/search",
-            params={
-                "q": "test",
-                "api_key": os.getenv("SERPAPI_API_KEY"),
-                "engine": "google",
-                "num": 1
-            }
+    if not url or not key:
+        return False
+    
+    try:
+        response = requests.get(
+            f"{url}/rest/v1/",
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}"
+            },
+            timeout=10
         )
-    else:
-        print("⚠️  SerpAPI: No API key found")
+        return response.status_code in [200, 404]  # 404 is OK, means connection works
+    except Exception as e:
+        logger.error(f"Supabase test failed: {e}")
+        return False
+
+def test_all_apis() -> Dict[str, bool]:
+    """Test all API connections and return results"""
+    tests = {
+        "News API": test_news_api,
+        "MediaStack": test_mediastack_api,
+        "Tavily": test_tavily_api,
+        "SerpAPI": test_serpapi,
+        "Alpha Vantage": test_alpha_vantage,
+        "Google Gemini": test_google_gemini,
+        "Supabase": test_supabase,
+    }
     
-    # Summary
-    print(f"\n📊 Summary:")
-    working = sum(1 for status in results.values() if status)
-    total = len(results)
-    print(f"✅ Working APIs: {working}/{total}")
-    
-    if working == total:
-        print("🎉 All API keys are configured and working!")
-    else:
-        print("⚠️  Some API keys need attention. Check the failed ones above.")
+    results = {}
+    for name, test_func in tests.items():
+        try:
+            results[name] = test_func()
+        except Exception as e:
+            logger.error(f"Error testing {name}: {e}")
+            results[name] = False
     
     return results
 
 if __name__ == "__main__":
-    asyncio.run(test_all_apis())
+    results = test_all_apis()
+    print("\n=== API Connection Test Results ===")
+    for api, status in results.items():
+        status_icon = "✅" if status else "❌"
+        print(f"{status_icon} {api}: {'Connected' if status else 'Failed'}")
+    
+    working_count = sum(1 for status in results.values() if status)
+    total_count = len(results)
+    print(f"\nSummary: {working_count}/{total_count} APIs working")

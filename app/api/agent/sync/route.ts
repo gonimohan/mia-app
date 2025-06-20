@@ -1,4 +1,3 @@
-
 import { type NextRequest, NextResponse } from "next/server"
 
 const PYTHON_API_BASE_URL = process.env.PYTHON_AGENT_API_BASE_URL || "http://0.0.0.0:8000"
