@@ -2,7 +2,7 @@
 
 import type React from "react"
 
-import { useState } from "react"
+import { useState, useEffect } from "react" // Added useEffect
 import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { Eye, EyeOff, Mail, Lock, LogIn } from "lucide-react"
@@ -13,19 +13,27 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { supabase } from "@/lib/supabase"
 import { useToast } from "@/hooks/use-toast"
+import { useAuth } from "@/components/auth-provider" // Added useAuth
 
 export default function LoginPage() {
   const [email, setEmail] = useState("")
   const [password, setPassword] = useState("")
   const [showPassword, setShowPassword] = useState(false)
-  const [loading, setLoading] = useState(false)
+  const [formLoading, setFormLoading] = useState(false) // Renamed to avoid conflict
   const [error, setError] = useState("")
   const router = useRouter()
   const { toast } = useToast()
+  const { user, loading: authLoading } = useAuth(); // Called useAuth
+
+  useEffect(() => {
+    if (!authLoading && user && router) {
+      router.push("/dashboard");
+    }
+  }, [user, authLoading, router]);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault()
-    setLoading(true)
+    setFormLoading(true) // Use renamed state setter
     setError("")
 
     try {
@@ -60,7 +68,7 @@ export default function LoginPage() {
         variant: "destructive",
       })
     } finally {
-      setLoading(false)
+      setFormLoading(false) // Use renamed state setter
     }
   }
 
@@ -157,9 +165,9 @@ export default function LoginPage() {
             <Button
               type="submit"
               className="w-full bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-700 hover:to-pink-700 text-white"
-              disabled={loading}
+              disabled={formLoading} // Use renamed state
             >
-              {loading ? (
+              {formLoading ? ( // Use renamed state
                 <div className="flex items-center gap-2">
                   <div className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
                   Signing in...
