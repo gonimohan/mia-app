@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react" // Added useEffect
+import { useState, useEffect } from "react"
 import {
   Database,
   Plus,
@@ -16,7 +16,7 @@ import {
   Newspaper,
   TrendingUp,
   Search,
-  Loader2, // For loading state
+  Loader2,
 } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
@@ -34,12 +34,11 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  // DialogTrigger, // Manual control for dialogs
-  DialogClose, // For cancel buttons
+  DialogClose,
 } from "@/components/ui/dialog"
-import { useAuth } from "@/components/auth-provider" // For getting user token
-import { createClientComponentClient } from "@supabase/auth-helpers-nextjs" // For client-side Supabase
-import { useToast } from "@/hooks/use-toast" // For notifications
+import { useAuth } from "@/components/auth-provider" // For getting user token and supabaseClient
+// import { createClientComponentClient } from "@supabase/auth-helpers-nextjs" // REMOVE THIS
+import { useToast } from "@/hooks/use-toast"
 
 
 import { APIKeyManager } from "@/components/api-key-manager"
@@ -49,26 +48,23 @@ interface DataSource {
   id: string;
   name: string;
   type: string;
-  status: "active" | "inactive" | "error" | string; // Allow string for flexibility from backend
-  last_sync?: string | null; // Made optional to match backend
+  status: "active" | "inactive" | "error" | string;
+  last_sync?: string | null;
   config: Record<string, any>;
   description?: string | null;
-  category?: "news" | "financial" | "search" | "ai" | string | null; // Allow string
-  user_id?: string; // From backend
+  category?: "news" | "financial" | "search" | "ai" | string | null;
+  user_id?: string;
   created_at?: string;
   updated_at?: string;
 }
 
-// mockDataSources removed
-
 export default function DataIntegrationPage() {
   const { toast } = useToast();
-  const supabase = createClientComponentClient(); // Initialize Supabase client
+  const { supabaseClient, user, loading: authLoading, isConfigured } = useAuth(); // Use client from AuthProvider
 
   const [dataSources, setDataSources] = useState<DataSource[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(true); // This can be page specific loading
 
-  // State for Add/Edit Dialog
   const [isModifyDialogOpen, setIsModifyDialogOpen] = useState(false);
   const [editingSource, setEditingSource] = useState<DataSource | null>(null);
   const [currentFormData, setCurrentFormData] = useState({
@@ -76,35 +72,42 @@ export default function DataIntegrationPage() {
     type: "api",
     description: "",
     category: "",
-    // For config, we'll handle 'endpoint' and 'apiKey' as special cases for now
-    // based on the existing form, but ideally, config should be more flexible.
     endpoint: "",
     apiKey: "",
-    // Add other common config fields if necessary, or a general JSON input for config
   });
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-
-  // State for Delete Dialog
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false);
   const [deletingSourceId, setDeletingSourceId] = useState<string | null>(null);
 
-  // State for testing connection
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
-  // State for syncing data source
   const [syncingSourceId, setSyncingSourceId] = useState<string | null>(null);
 
-
   const getAuthToken = async () => {
-    const session = await supabase.auth.getSession();
-    return session.data.session?.access_token;
+    if (!supabaseClient) return null;
+    const { data: { session } } = await supabaseClient.auth.getSession();
+    return session?.access_token;
   };
 
   const fetchDataSources = async () => {
+    if (!supabaseClient || !isConfigured) {
+      setIsLoading(false); // Stop loading if Supabase isn't ready
+      if (isConfigured === false && !authLoading) { // Check isConfigured is explicitly false and auth is not loading
+         toast({ title: "Configuration Error", description: "Supabase is not configured.", variant: "destructive" });
+      }
+      return;
+    }
     setIsLoading(true);
     try {
       const token = await getAuthToken();
-      if (!token) throw new Error("Authentication token not found.");
+      if (!token) {
+        // This might happen if session is lost or user is logged out
+        // AuthProvider should handle redirecting to login in such cases via ProtectedRoute
+        toast({ title: "Authentication Error", description: "Session not found. Please log in.", variant: "destructive" });
+        setDataSources([]);
+        setIsLoading(false);
+        return;
+      }
 
       const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -121,12 +124,31 @@ export default function DataIntegrationPage() {
     }
   };
 
+  // Effect for initial data load, depends on supabaseClient and auth state
+  useEffect(() => {
+    if (!authLoading && isConfigured && supabaseClient) {
+      fetchDataSources();
+    } else if (!authLoading && !isConfigured) {
+        setIsLoading(false);
+        toast({ title: "Configuration Error", description: "Supabase is not configured. Cannot fetch data.", variant: "destructive" });
+    }
+    // Intentionally not adding fetchDataSources to deps array if it's stable
+    // or wrap it in useCallback if it changes frequently.
+    // For now, this effect runs when auth state settles.
+  }, [authLoading, isConfigured, supabaseClient, toast]);
+
+
   const handleTestConnection = async (sourceId: string) => {
+    if (!supabaseClient) {
+      toast({ title: "Error", description: "Supabase client not available.", variant: "destructive" });
+      return;
+    }
     setTestingSourceId(sourceId);
     try {
       const token = await getAuthToken();
       if (!token) {
         toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+        setTestingSourceId(null);
         return;
       }
 
@@ -137,16 +159,14 @@ export default function DataIntegrationPage() {
 
       const responseData = await response.json();
 
-      if (!response.ok) { // Handles HTTP errors like 500, 404, 403 from the test endpoint itself
+      if (!response.ok) {
         throw new Error(responseData.detail || `API error: ${response.status}`);
       }
 
-      // response.ok is true, now check test_successful from responseData
       if (responseData.test_successful) {
         toast({
           title: "Connection Test Successful",
           description: `Successfully connected to ${responseData.tested_service_type}. Message: ${responseData.message}`,
-          variant: "default", // Or a success variant if you have one
         });
       } else {
         toast({
@@ -155,12 +175,12 @@ export default function DataIntegrationPage() {
           variant: "destructive",
         });
       }
-      fetchDataSources(); // Refresh data sources as status might have changed
+      fetchDataSources();
     } catch (error: any) {
       console.error("Test connection error:", error);
       toast({
         title: "Connection Test Error",
-        description: error.message || "An unexpected error occurred while testing the connection.",
+        description: error.message || "An unexpected error occurred.",
         variant: "destructive",
       });
     } finally {
@@ -169,11 +189,16 @@ export default function DataIntegrationPage() {
   };
 
   const handleSyncNow = async (sourceId: string) => {
+    if (!supabaseClient) {
+        toast({ title: "Error", description: "Supabase client not available.", variant: "destructive" });
+        return;
+    }
     setSyncingSourceId(sourceId);
     try {
       const token = await getAuthToken();
       if (!token) {
         toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+        setSyncingSourceId(null);
         return;
       }
 
@@ -182,7 +207,7 @@ export default function DataIntegrationPage() {
         headers: { Authorization: `Bearer ${token}` },
       });
 
-      const responseData = await response.json(); // Assuming backend returns JSON like { message: "Sync started", ... } or { detail: "Error" }
+      const responseData = await response.json();
 
       if (!response.ok) {
         throw new Error(responseData.detail || `API error: ${response.status}`);
@@ -190,25 +215,20 @@ export default function DataIntegrationPage() {
 
       toast({
         title: "Synchronization Started",
-        description: responseData.message || `Sync process initiated for data source.`,
-        variant: "default",
+        description: responseData.message || `Sync process initiated.`,
       });
-      fetchDataSources(); // Refresh data to update last_sync, status etc.
+      fetchDataSources();
     } catch (error: any) {
       console.error("Sync now error:", error);
       toast({
         title: "Synchronization Error",
-        description: error.message || "An unexpected error occurred while starting synchronization.",
+        description: error.message || "An unexpected error occurred.",
         variant: "destructive",
       });
     } finally {
       setSyncingSourceId(null);
     }
   };
-
-  useEffect(() => {
-    fetchDataSources();
-  }, []);
 
 
   const handleOpenAddDialog = () => {
@@ -225,12 +245,16 @@ export default function DataIntegrationPage() {
       description: source.description || "",
       category: source.category || "",
       endpoint: source.config?.endpoint || "",
-      apiKey: source.config?.apiKey || "",
+      apiKey: "", // Keep API key blank for edit forms for security, backend should handle partial updates
     });
     setIsModifyDialogOpen(true);
   };
 
   const handleFormSubmit = async () => {
+    if (!supabaseClient) {
+        toast({ title: "Error", description: "Supabase client not available.", variant: "destructive" });
+        return;
+    }
     setIsSubmitting(true);
     const token = await getAuthToken();
     if (!token) {
@@ -246,19 +270,13 @@ export default function DataIntegrationPage() {
       category: currentFormData.category || null,
       config: {
         endpoint: currentFormData.endpoint,
-        // apiKey should ideally be handled more securely, e.g. never re-fetched to client
-        // For updates, if apiKey is not changed, don't send it or send a placeholder
-        // For this subtask, we'll send it if provided.
-        ...(currentFormData.apiKey && { apiKey: currentFormData.apiKey }),
       },
     };
+    // Only include apiKey in the payload if it's provided (for new sources or if explicitly changed)
+    if (currentFormData.apiKey) {
+        payload.config.apiKey = currentFormData.apiKey;
+    }
 
-    // If it's an edit and API key is not re-entered, we might not want to overwrite it with an empty string.
-    // However, the backend PUT is designed for partial updates, so sending an empty apiKey if it was cleared is fine.
-    // Or, we can choose not to include apiKey in config if currentFormData.apiKey is empty.
-    // For now, if apiKey field is empty, it means user wants to clear/not set it if it's a new source.
-    // If editing, and apiKey is not touched, it's tricky without knowing original config structure well.
-    // The current setup implies apiKey is part of config.
 
     const url = editingSource
       ? `${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources/${editingSource.id}`
@@ -275,7 +293,7 @@ export default function DataIntegrationPage() {
       if (!response.ok) throw new Error(result.detail || "Failed to save data source.");
 
       toast({ title: "Success", description: `Data source ${editingSource ? 'updated' : 'added'} successfully.` });
-      fetchDataSources(); // Refresh list
+      fetchDataSources();
       setIsModifyDialogOpen(false);
     } catch (error: any) {
       console.error(error);
@@ -291,8 +309,11 @@ export default function DataIntegrationPage() {
   };
 
   const handleConfirmDelete = async () => {
-    if (!deletingSourceId) return;
-    setIsSubmitting(true); // Use same submitting state for delete dialog
+    if (!deletingSourceId || !supabaseClient) {
+        toast({ title: "Error", description: "Supabase client not available or source ID missing.", variant: "destructive" });
+        return;
+    }
+    setIsSubmitting(true);
     const token = await getAuthToken();
     if (!token) {
       toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
@@ -306,14 +327,15 @@ export default function DataIntegrationPage() {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!response.ok) {
-        const result = await response.json().catch(() => null); // Try to parse error
+        const result = await response.json().catch(() => null);
         throw new Error(result?.detail || `Failed to delete data source. Status: ${response.status}`);
       }
       toast({ title: "Success", description: "Data source deleted successfully." });
-      fetchDataSources(); // Refresh list
+      fetchDataSources();
       setIsDeleteDialogOpen(false);
       setDeletingSourceId(null);
-    } catch (error: any) {
+    } catch (error: any)
+      {
       console.error(error);
       toast({ title: "Error", description: error.message || "Could not delete data source.", variant: "destructive" });
     } finally {
@@ -321,6 +343,7 @@ export default function DataIntegrationPage() {
     }
   };
 
+  // Helper functions getStatusIcon, getStatusBadge, getSourceIcon remain the same
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -338,18 +361,19 @@ export default function DataIntegrationPage() {
       active: "bg-neon-green/20 text-neon-green border-neon-green/50",
       error: "bg-neon-pink/20 text-neon-pink border-neon-pink/50",
       inactive: "bg-gray-500/20 text-gray-400 border-gray-500/50",
-    }
+    } as const; // Added 'as const' for stricter typing on variants key
+
+    const statusKey = status as keyof typeof variants; // Type assertion
+    const badgeClass = variants[statusKey] || variants.inactive; // Fallback to inactive
 
     return (
-      <Badge className={`${variants[status as keyof typeof variants]} border`}>
+      <Badge className={`${badgeClass} border`}>
         {status.charAt(0).toUpperCase() + status.slice(1)}
       </Badge>
     )
   }
 
-  // handleAddSource is replaced by handleFormSubmit
-
-  const getSourceIcon = (type: string, category?: string | null) => { // category can be null
+  const getSourceIcon = (type: string, category?: string | null) => {
     if (type === "llm") return <Zap className="w-5 h-5 text-neon-purple" />
     if (category === "news") return <Newspaper className="w-5 h-5 text-neon-blue" />
     if (category === "financial") return <TrendingUp className="w-5 h-5 text-neon-green" />
@@ -357,9 +381,36 @@ export default function DataIntegrationPage() {
     return <Globe className="w-5 h-5 text-neon-orange" />
   }
 
+  // Conditional rendering based on authLoading or page-specific isLoading
+  if (authLoading || isLoading && isConfigured) { // Show loader if auth is loading OR (page is loading AND Supabase is configured)
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-dark-bg">
+        <Loader2 className="w-12 h-12 text-neon-blue animate-spin" />
+      </div>
+    );
+  }
+
+  if (!isConfigured) { // If supabase is not configured, show a message (already handled by AuthProvider too)
+     return (
+      <div className="flex items-center justify-center min-h-screen bg-dark-bg text-white">
+        Supabase is not configured. Please check your environment variables.
+      </div>
+    );
+  }
+
+  if (!user && !authLoading) { // If no user and auth is not loading, ProtectedRoute should handle redirect.
+                               // This is a fallback or can be a specific message.
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-dark-bg text-white">
+        Redirecting to login...
+      </div>
+    );
+  }
+
+
+  // Main component JSX starts here
   return (
     <SidebarInset className="bg-dark-bg">
-      {/* Header */}
       <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
         <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
         <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
@@ -368,7 +419,6 @@ export default function DataIntegrationPage() {
           <h1 className="text-lg font-semibold text-white">Data Integration</h1>
         </div>
         <div className="ml-auto">
-          {/* Add New Data Source Button - Triggers Dialog */}
           <Button
             onClick={handleOpenAddDialog}
             className="bg-neon-green/20 border border-neon-green/50 text-neon-green hover:bg-neon-green/30 hover:shadow-neon-green/50 hover:shadow-lg transition-all duration-300"
@@ -379,15 +429,14 @@ export default function DataIntegrationPage() {
         </div>
       </header>
 
-      {/* Main Content */}
       <div className="flex flex-1 flex-col gap-6 p-6">
-        {isLoading && (
+        {isLoading && dataSources.length === 0 && ( // Show loader only if actively loading AND no data yet
           <div className="flex justify-center items-center py-10">
             <Loader2 className="w-8 h-8 text-neon-blue animate-spin" />
             <p className="ml-2 text-white">Loading data sources...</p>
           </div>
         )}
-        {!isLoading && (
+        {(!isLoading || dataSources.length > 0) && ( // Show tabs if not loading OR if there's data (even if a refresh is loading)
         <Tabs defaultValue="sources" className="w-full">
           <TabsList className="grid w-full grid-cols-4 bg-dark-card border border-dark-border">
             <TabsTrigger
@@ -427,13 +476,7 @@ export default function DataIntegrationPage() {
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <div className="p-2 rounded-lg bg-neon-orange/20">
-                          {source.type === "api" ? (
-                            <Globe className="w-5 h-5 text-neon-orange" />
-                          ) : source.type === "database" ? (
-                            <Database className="w-5 h-5 text-neon-orange" />
-                          ) : (
-                            <FileText className="w-5 h-5 text-neon-orange" />
-                          )}
+                          {getSourceIcon(source.type, source.category)}
                         </div>
                         <div>
                           <CardTitle className="text-white">{source.name}</CardTitle>
@@ -501,11 +544,19 @@ export default function DataIntegrationPage() {
                   </CardContent>
                 </Card>
               ))}
+               {dataSources.length === 0 && !isLoading && ( // Message if no data sources and not loading
+                <Card className="bg-dark-card border-dark-border text-center py-10">
+                  <CardContent>
+                    <Search className="w-16 h-16 text-gray-500 mx-auto mb-4" />
+                    <p className="text-xl font-semibold text-white">No Data Sources Found</p>
+                    <p className="text-gray-400">Get started by adding a new data source.</p>
+                  </CardContent>
+                </Card>
+              )}
             </div>
           </TabsContent>
 
           <TabsContent value="api-keys" className="space-y-4">
-            {/* Pass the live dataSources state to the APIKeyManager */}
             <APIKeyManager
               dataSources={dataSources}
               onTestConnection={(sourceId) => handleTestConnection(sourceId)}
@@ -593,10 +644,10 @@ export default function DataIntegrationPage() {
             </Card>
           </TabsContent>
         </Tabs>
-        )} {/* End of !isLoading condition */}
+        )}
       </div>
 
-      {/* Add/Edit Dialog */}
+      {/* Dialogs remain the same */}
       <Dialog open={isModifyDialogOpen} onOpenChange={setIsModifyDialogOpen}>
         <DialogContent className="bg-dark-card border-dark-border text-white">
           <DialogHeader>
@@ -653,11 +704,10 @@ export default function DataIntegrationPage() {
               <Label htmlFor="sourceApiKey">Config: API Key (optional)</Label>
               <Input id="sourceApiKey" type="password" value={currentFormData.apiKey} onChange={(e) => setCurrentFormData({...currentFormData, apiKey: e.target.value})} className="bg-dark-bg border-dark-border" />
             </div>
-            {/* TODO: Add more fields for a flexible config object if needed, or a JSON editor */}
           </div>
           <DialogFooter>
             <DialogClose asChild><Button variant="outline" className="border-gray-600 text-gray-300 hover:bg-dark-bg">Cancel</Button></DialogClose>
-            <Button onClick={handleFormSubmit} disabled={isSubmitting} className="bg-neon-green/80 hover:bg-neon-green/70 text-white">
+            <Button onClick={handleFormSubmit} disabled={isSubmitting || !supabaseClient } className="bg-neon-green/80 hover:bg-neon-green/70 text-white">
               {isSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               {editingSource ? "Save Changes" : "Add Source"}
             </Button>
@@ -665,7 +715,6 @@ export default function DataIntegrationPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Delete Confirmation Dialog */}
       <Dialog open={isDeleteDialogOpen} onOpenChange={setIsDeleteDialogOpen}>
         <DialogContent className="bg-dark-card border-dark-border text-white sm:max-w-md">
           <DialogHeader>
@@ -676,7 +725,7 @@ export default function DataIntegrationPage() {
           </DialogHeader>
           <DialogFooter>
             <DialogClose asChild><Button variant="outline" className="border-gray-600 text-gray-300 hover:bg-dark-bg">Cancel</Button></DialogClose>
-            <Button onClick={handleConfirmDelete} disabled={isSubmitting} variant="destructive" className="bg-neon-pink hover:bg-neon-pink/80">
+            <Button onClick={handleConfirmDelete} disabled={isSubmitting || !supabaseClient} variant="destructive" className="bg-neon-pink hover:bg-neon-pink/80">
               {isSubmitting ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Delete
             </Button>

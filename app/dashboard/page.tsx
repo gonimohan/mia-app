@@ -38,13 +38,13 @@ import { useToast } from "@/hooks/use-toast"
 
 // Sample data for charts
 // const trendData = [ // This will be replaced by fetched data
-  { month: "Jan", value: 65, competitors: 45 },
-  { month: "Feb", value: 72, competitors: 48 },
-  { month: "Mar", value: 68, competitors: 52 },
-  { month: "Apr", value: 85, competitors: 58 },
-  { month: "May", value: 92, competitors: 62 },
-  { month: "Jun", value: 88, competitors: 65 },
-]
+//   { month: "Jan", value: 65, competitors: 45 },
+//   { month: "Feb", value: 72, competitors: 48 },
+//   { month: "Mar", value: 68, competitors: 52 },
+//   { month: "Apr", value: 85, competitors: 58 },
+//   { month: "May", value: 92, competitors: 62 },
+//   { month: "Jun", value: 88, competitors: 65 },
+// ]
 
 const marketShareData = [
   { name: "Our Company", value: 35, color: "#00FFFF" },
