@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Key, Eye, EyeOff, Copy, Check, RefreshCw, AlertTriangle } from "lucide-react"
+import { Key, Eye, EyeOff, Copy, Check, RefreshCw, AlertTriangle, Loader2 } from "lucide-react" // Added Loader2
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -25,6 +25,9 @@ interface DataSourceFromParent {
 
 interface APIKeyManagerProps {
   dataSources: DataSourceFromParent[];
+  onTestConnection: (sourceId: string) => void;
+  onEditSource: (sourceId: string) => void;
+  isLoadingTest?: string | null; // ID of the source being tested
 }
 
 // Define ProcessedKey for internal use within APIKeyManager
@@ -118,20 +121,7 @@ export function APIKeyManager({ dataSources }: APIKeyManagerProps) {
     }
   }
 
-  const testConnection = async (apiKey: ProcessedKey) => { // Updated to ProcessedKey
-    toast({
-      title: "Testing Connection",
-      description: `Testing connection to ${apiKey.service}...`,
-    })
-
-    // Simulate API test
-    setTimeout(() => {
-      toast({
-        title: "Connection Successful",
-        description: `${apiKey.name} is working correctly.`,
-      })
-    }, 2000)
-  }
+  // Removed local placeholder testConnection function
 
   const getStatusBadge = (status: ProcessedKey['status']) => { // Updated to use ProcessedKey['status']
     const variants = {
@@ -262,13 +252,23 @@ export function APIKeyManager({ dataSources }: APIKeyManagerProps) {
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => testConnection(processedKey)} // Use processedKey
+                        onClick={() => props.onTestConnection(processedKey.id)} // Call prop
                         className="border-neon-blue/50 text-neon-blue hover:bg-neon-blue/10"
+                        disabled={props.isLoadingTest === processedKey.id} // Disable if this key is being tested
                       >
-                        <RefreshCw className="w-3 h-3 mr-1" />
-                        Test
+                        {props.isLoadingTest === processedKey.id ? (
+                          <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                        ) : (
+                          <RefreshCw className="w-3 h-3 mr-1" />
+                        )}
+                        {props.isLoadingTest === processedKey.id ? "Testing..." : "Test"}
                       </Button>
-                      <Button size="sm" variant="outline" className="border-gray-600 text-gray-400 hover:bg-dark-bg">
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="border-gray-600 text-gray-400 hover:bg-dark-bg"
+                        onClick={() => props.onEditSource(processedKey.id)} // Call prop
+                      >
                         Edit
                       </Button>
                     </div>

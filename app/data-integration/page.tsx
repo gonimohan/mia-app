@@ -91,6 +91,8 @@ export default function DataIntegrationPage() {
 
   // State for testing connection
   const [testingSourceId, setTestingSourceId] = useState<string | null>(null);
+  // State for syncing data source
+  const [syncingSourceId, setSyncingSourceId] = useState<string | null>(null);
 
 
   const getAuthToken = async () => {
@@ -163,6 +165,44 @@ export default function DataIntegrationPage() {
       });
     } finally {
       setTestingSourceId(null);
+    }
+  };
+
+  const handleSyncNow = async (sourceId: string) => {
+    setSyncingSourceId(sourceId);
+    try {
+      const token = await getAuthToken();
+      if (!token) {
+        toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+        return;
+      }
+
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/data-sources/${sourceId}/sync`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+      });
+
+      const responseData = await response.json(); // Assuming backend returns JSON like { message: "Sync started", ... } or { detail: "Error" }
+
+      if (!response.ok) {
+        throw new Error(responseData.detail || `API error: ${response.status}`);
+      }
+
+      toast({
+        title: "Synchronization Started",
+        description: responseData.message || `Sync process initiated for data source.`,
+        variant: "default",
+      });
+      fetchDataSources(); // Refresh data to update last_sync, status etc.
+    } catch (error: any) {
+      console.error("Sync now error:", error);
+      toast({
+        title: "Synchronization Error",
+        description: error.message || "An unexpected error occurred while starting synchronization.",
+        variant: "destructive",
+      });
+    } finally {
+      setSyncingSourceId(null);
     }
   };
 
@@ -445,8 +485,16 @@ export default function DataIntegrationPage() {
                           )}
                           {testingSourceId === source.id ? "Testing..." : "Test Connection"}
                         </Button>
-                        <Button size="sm" className="bg-neon-blue/20 text-neon-blue hover:bg-neon-blue/30">
-                          Sync Now
+                        <Button
+                          size="sm"
+                          className="bg-neon-blue/20 text-neon-blue hover:bg-neon-blue/30"
+                          onClick={() => handleSyncNow(source.id)}
+                          disabled={syncingSourceId === source.id}
+                        >
+                          {syncingSourceId === source.id ? (
+                            <Loader2 className="w-4 h-4 mr-1.5 animate-spin" />
+                          ) : null}
+                          {syncingSourceId === source.id ? "Syncing..." : "Sync Now"}
                         </Button>
                       </div>
                     </div>
@@ -458,7 +506,19 @@ export default function DataIntegrationPage() {
 
           <TabsContent value="api-keys" className="space-y-4">
             {/* Pass the live dataSources state to the APIKeyManager */}
-            <APIKeyManager dataSources={dataSources} />
+            <APIKeyManager
+              dataSources={dataSources}
+              onTestConnection={(sourceId) => handleTestConnection(sourceId)}
+              onEditSource={(sourceId) => {
+                const sourceToEdit = dataSources.find(ds => ds.id === sourceId);
+                if (sourceToEdit) {
+                  handleOpenEditDialog(sourceToEdit);
+                } else {
+                  toast({ title: "Error", description: "Could not find data source to edit.", variant: "destructive" });
+                }
+              }}
+              isLoadingTest={testingSourceId}
+            />
           </TabsContent>
 
           <TabsContent value="real-time" className="space-y-4">

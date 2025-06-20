@@ -4,6 +4,7 @@ import { useState, useEffect } from "react" // Added useEffect
 import { Users, TrendingUp, TrendingDown, Building, DollarSign, BarChart3, Eye, Search, Filter } from "lucide-react"
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
+import { useToast } from "@/hooks/use-toast" // Import useToast
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
 import { Input } from "@/components/ui/input"
@@ -37,6 +38,8 @@ export default function CompetitorsPage() {
   const [competitors, setCompetitors] = useState<Competitor[]>([]) // Initialize with empty array
   const [searchTerm, setSearchTerm] = useState("")
   const [selectedThreatLevel, setSelectedThreatLevel] = useState<string>("all")
+  const threatLevels = ["all", "low", "medium", "high"]; // Defined threat levels
+  const { toast } = useToast(); // Initialize useToast
   const [combinedMarketShareState, setCombinedMarketShareState] = useState<number>(0);
   const [combinedRevenueState, setCombinedRevenueState] = useState<string>("N/A");
   const [isLoading, setIsLoading] = useState(true); // For loading state
@@ -133,6 +136,12 @@ export default function CompetitorsPage() {
     return matchesSearch && matchesThreat
   })
 
+  const handleFilterCycle = () => {
+    const currentIndex = threatLevels.indexOf(selectedThreatLevel);
+    const nextIndex = (currentIndex + 1) % threatLevels.length;
+    setSelectedThreatLevel(threatLevels[nextIndex]);
+  };
+
   const getThreatBadge = (level: string) => {
     const variants = {
       high: "bg-neon-pink/20 text-neon-pink border-neon-pink/50",
@@ -146,6 +155,13 @@ export default function CompetitorsPage() {
       </Badge>
     )
   }
+
+  const handleViewCompetitor = (competitorName: string) => {
+    toast({
+      title: "Feature Coming Soon",
+      description: `Detailed view for ${competitorName} is not yet implemented.`,
+    });
+  };
 
   return (
     <SidebarInset className="bg-dark-bg">
@@ -167,9 +183,13 @@ export default function CompetitorsPage() {
               className="pl-10 w-64 bg-dark-card border-dark-border text-white placeholder:text-gray-400"
             />
           </div>
-          <Button variant="outline" className="border-neon-green/50 text-neon-green hover:bg-neon-green/10">
+          <Button
+            variant="outline"
+            className="border-neon-green/50 text-neon-green hover:bg-neon-green/10"
+            onClick={handleFilterCycle}
+          >
             <Filter className="w-4 h-4 mr-2" />
-            Filter
+            Filter: {selectedThreatLevel.charAt(0).toUpperCase() + selectedThreatLevel.slice(1)}
           </Button>
         </div>
       </header>
@@ -240,13 +260,21 @@ export default function CompetitorsPage() {
         {/* Competitor Comparison Chart - REMOVED */}
 
         {/* Competitors List */}
-        <div className="grid gap-4">
-          {filteredCompetitors.map((competitor) => (
-            <Card
-              key={competitor.id}
-              className="bg-dark-card border-dark-border hover:border-opacity-50 transition-all duration-300"
-            >
-              <CardHeader>
+        {isLoading ? (
+          <Card className="bg-dark-card border-dark-border">
+            <CardContent className="p-6 text-center text-gray-400">
+              Loading competitors list...
+            </CardContent>
+          </Card>
+        ) : filteredCompetitors.length > 0 ? (
+          <div className="grid gap-4">
+            {filteredCompetitors.map((competitor) => (
+              <Card
+                key={competitor.id}
+                // ... rest of competitor card
+                className="bg-dark-card border-dark-border hover:border-opacity-50 transition-all duration-300"
+              >
+                <CardHeader>
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-4">
                     <div className="p-3 rounded-lg bg-neon-green/20">
@@ -265,6 +293,7 @@ export default function CompetitorsPage() {
                       variant="ghost"
                       size="icon"
                       className="text-gray-400 hover:text-neon-blue hover:bg-neon-blue/10"
+                      onClick={() => handleViewCompetitor(competitor.name)}
                     >
                       <Eye className="w-4 h-4" />
                     </Button>
@@ -332,8 +361,15 @@ export default function CompetitorsPage() {
                 </div>
               </CardContent>
             </Card>
-          ))}
-        </div>
+            ))}
+          </div>
+        ) : (
+          <Card className="bg-dark-card border-dark-border">
+            <CardContent className="p-6 text-center text-gray-400">
+              No competitors found matching your criteria.
+            </CardContent>
+          </Card>
+        )}
       </div>
     </SidebarInset>
   )
