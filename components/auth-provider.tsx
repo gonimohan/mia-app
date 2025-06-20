@@ -93,7 +93,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })
 
     return () => subscription?.unsubscribe() // Add null check for subscription
-  }, [configured, supabaseClient, loading]) // Add supabaseClient and loading to dependency array
+  }, [supabaseClient]) // Add supabaseClient and loading to dependency array
 
   const signOut = async () => {
     if (!configured || !supabaseClient) return
