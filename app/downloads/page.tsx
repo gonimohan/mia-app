@@ -1,20 +1,13 @@
 "use client"
 
-import { useState } from "react"
-import { useEffect } from "react" // Added useEffect
-import { Download, FileText, Info, List, BarChart3, Loader2, Zap } from "lucide-react" // Added Info, List, BarChart3, Loader2, Zap
+import { useState, useEffect } from "react"
+import { Download, FileText, Info, List, BarChart3, Loader2, Zap, Database, ImageIcon, Archive } from "lucide-react" // Added missing icons
 import { SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Separator } from "@/components/ui/separator"
-// Badge, Input, Select are removed as filters are removed for now
-// import { Badge } from "@/components/ui/badge"
-// import { Input } from "@/components/ui/input"
-// import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
-// Tabs are removed for now, can be added back if view toggle is needed
-// import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useToast } from "@/hooks/use-toast"
-import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"
+import { useAuth } from "@/components/auth-provider" // Import useAuth
 
 // Interfaces matching backend Pydantic models
 interface AnalysisStateSummary {
@@ -23,8 +16,8 @@ interface AnalysisStateSummary {
   query?: string | null;
   created_at: string; // ISO string
   user_id?: string | null;
-  report_filename?: string | null; // Placeholder in backend
-  status?: string | null; // Placeholder in backend
+  report_filename?: string | null;
+  status?: string | null;
 }
 
 interface DownloadableFile {
@@ -33,11 +26,9 @@ interface DownloadableFile {
   description?: string | null;
 }
 
-// No longer using DownloadItem or mockDownloads
-
 export default function DownloadsPage() {
   const { toast } = useToast();
-  const supabase = createClientComponentClient();
+  const { supabaseClient, user, loading: authLoading, isConfigured } = useAuth(); // Use client from AuthProvider
 
   const [analysisStates, setAnalysisStates] = useState<AnalysisStateSummary[]>([]);
   const [selectedStateId, setSelectedStateId] = useState<string | null>(null);
@@ -46,20 +37,35 @@ export default function DownloadsPage() {
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
 
   const getAuthToken = async () => {
-    const session = await supabase.auth.getSession();
-    if (session.error) {
-      console.error("Auth Error:", session.error.message);
-      toast({ title: "Authentication Error", description: session.error.message, variant: "destructive" });
+    if (!supabaseClient) return null; // Check if supabaseClient is available
+    const { data: { session }, error } = await supabaseClient.auth.getSession(); // Use supabaseClient
+    if (error) {
+      console.error("Auth Error:", error.message);
+      toast({ title: "Authentication Error", description: error.message, variant: "destructive" });
       return null;
     }
-    return session.data.session?.access_token;
+    return session?.access_token;
   };
 
   const fetchAnalysisStates = async () => {
+    if (!supabaseClient || !isConfigured) { // Check supabaseClient and configuration
+      setIsLoadingStates(false);
+      if (!authLoading && !isConfigured) {
+         toast({ title: "Configuration Error", description: "Supabase is not configured. Cannot fetch analyses.", variant: "destructive" });
+      }
+      return;
+    }
     setIsLoadingStates(true);
     try {
       const token = await getAuthToken();
-      if (!token) throw new Error("Not authenticated.");
+      if (!token) {
+        // This case should be handled by auth checks before calling, or by getAuthToken itself.
+        // If still no token, user might be logged out. AuthProvider should manage redirects.
+        toast({ title: "Authentication Error", description: "Session not found. Please log in again.", variant: "destructive" });
+        setAnalysisStates([]);
+        setIsLoadingStates(false);
+        return;
+      }
 
       const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/analysis-states`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -73,20 +79,31 @@ export default function DownloadsPage() {
     } catch (error: any) {
       console.error("Fetch Analysis States Error:", error);
       toast({ title: "Error Fetching Analyses", description: error.message, variant: "destructive" });
-      setAnalysisStates([]); // Clear on error
+      setAnalysisStates([]);
     } finally {
       setIsLoadingStates(false);
     }
   };
 
   const fetchStateDownloadableFiles = async (stateId: string) => {
-    if (!stateId) return;
+    if (!stateId || !supabaseClient || !isConfigured) { // Check supabaseClient and configuration
+       setIsLoadingFiles(false);
+       if (!authLoading && !isConfigured) {
+          toast({ title: "Configuration Error", description: "Supabase is not configured. Cannot fetch files.", variant: "destructive" });
+       }
+      return;
+    }
     setSelectedStateId(stateId);
     setIsLoadingFiles(true);
-    setSelectedStateFiles([]); // Clear previous files
+    setSelectedStateFiles([]);
     try {
       const token = await getAuthToken();
-      if (!token) throw new Error("Not authenticated.");
+      if (!token) {
+        toast({ title: "Authentication Error", description: "Session not found. Please log in again.", variant: "destructive" });
+        setSelectedStateFiles([]);
+        setIsLoadingFiles(false);
+        return;
+      }
 
       const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/analysis-states/${stateId}/downloads`, {
         headers: { Authorization: `Bearer ${token}` },
@@ -95,7 +112,7 @@ export default function DownloadsPage() {
          const errorData = await response.json().catch(() => ({ detail: "Failed to fetch downloadable files."}));
         throw new Error(errorData.detail);
       }
-      const data: { files: DownloadableFile[] } = await response.json(); // Backend returns StateDownloadsResponse
+      const data: { files: DownloadableFile[] } = await response.json();
       setSelectedStateFiles(data.files || []);
     } catch (error: any) {
       console.error("Fetch Downloadable Files Error:", error);
@@ -107,6 +124,10 @@ export default function DownloadsPage() {
   };
 
   const handleDownload = async (stateId: string, fileIdentifier: string, filenameToSave: string) => {
+    if (!supabaseClient || !isConfigured) { // Check supabaseClient and configuration
+      toast({ title: "Configuration Error", description: "Supabase is not configured.", variant: "destructive"});
+      return;
+    }
     const token = await getAuthToken();
     if (!token) {
       toast({ title: "Authentication Error", description: "Could not get auth token.", variant: "destructive"});
@@ -135,23 +156,85 @@ export default function DownloadsPage() {
     }
   };
 
-
   useEffect(() => {
-    fetchAnalysisStates();
-  }, []);
+    // Fetch data only when auth state is settled, Supabase is configured, and client is available
+    if (!authLoading && isConfigured && supabaseClient) {
+      fetchAnalysisStates();
+    } else if (!authLoading && !isConfigured) {
+      setIsLoadingStates(false); // Ensure loading stops if not configured
+      toast({ title: "Configuration Error", description: "Supabase is not configured. Cannot fetch data.", variant: "destructive" });
+    }
+    // Not adding fetchAnalysisStates to deps to avoid re-runs if it's stable.
+    // If it changes, wrap in useCallback.
+  }, [authLoading, isConfigured, supabaseClient, toast]);
 
 
   const getFileIcon = (filename: string) => {
     const extension = filename.split('.').pop()?.toLowerCase();
     switch (extension) {
       case "pdf": return <FileText className="w-5 h-5 text-neon-pink" />;
-      case "json": return <Database className="w-5 h-5 text-neon-blue" />;
-      case "csv": return <Database className="w-5 h-5 text-neon-green" />;
+      case "json": return <Database className="w-5 h-5 text-neon-blue" />; // Changed icon for JSON
+      case "csv": return <List className="w-5 h-5 text-neon-green" />; // Changed icon for CSV
       case "png": return <ImageIcon className="w-5 h-5 text-neon-purple" />;
       case "md": return <FileText className="w-5 h-5 text-neon-orange" />;
       default: return <Archive className="w-5 h-5 text-gray-400" />;
     }
   };
+
+  // Broader loading state for the page until auth is resolved
+  if (authLoading) {
+    return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Download className="w-5 h-5 text-neon-green" />
+             <h1 className="text-lg font-semibold text-white">Downloads</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center">
+          <Loader2 className="w-10 h-10 text-neon-blue animate-spin" />
+        </div>
+      </SidebarInset>
+    );
+  }
+
+  if (!isConfigured) {
+     return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Download className="w-5 h-5 text-neon-green" />
+             <h1 className="text-lg font-semibold text-white">Downloads</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center text-white">
+          Supabase is not configured. Please check your environment settings.
+        </div>
+      </SidebarInset>
+    );
+  }
+
+  if (!user && !authLoading) { // Should be handled by ProtectedRoute, but as a fallback
+    return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Download className="w-5 h-5 text-neon-green" />
+             <h1 className="text-lg font-semibold text-white">Downloads</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center text-white">
+          Redirecting to login...
+        </div>
+      </SidebarInset>
+    );
+  }
 
 
   return (
@@ -194,6 +277,7 @@ export default function DownloadsPage() {
                       variant="ghost"
                       className={`w-full justify-start p-3 text-left h-auto hover:bg-dark-bg/70 ${selectedStateId === state.state_id ? 'bg-neon-blue/20 text-neon-blue' : 'text-white'}`}
                       onClick={() => fetchStateDownloadableFiles(state.state_id)}
+                      disabled={!supabaseClient || !isConfigured} // Disable if client not ready
                     >
                       <div className="flex flex-col">
                         <span className="font-medium">Query: {state.query || "N/A"}</span>
@@ -234,7 +318,7 @@ export default function DownloadsPage() {
                         {getFileIcon(file.filename)}
                         <div className="flex-grow min-w-0">
                           <p className="text-white font-medium truncate" title={file.filename}>{file.filename}</p>
-                          <p className="text-xs text-gray-400 truncate" title={file.description || undefined}>{file.description || file.category.replace('_', ' ').title()}</p>
+                          <p className="text-xs text-gray-400 truncate" title={file.description || undefined}>{file.description || file.category.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}</p>
                         </div>
                       </div>
                       <Button
@@ -242,6 +326,7 @@ export default function DownloadsPage() {
                         variant="outline"
                         onClick={() => handleDownload(selectedStateId, file.filename, file.filename)}
                         className="border-neon-green/50 text-neon-green hover:bg-neon-green/10 ml-4"
+                        disabled={!supabaseClient || !isConfigured} // Disable if client not ready
                       >
                         <Download className="w-3 h-3 mr-1.5" />
                         Download

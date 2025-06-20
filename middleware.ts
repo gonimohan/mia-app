@@ -1,63 +1,85 @@
-import { createRouteHandlerClient } from "@supabase/auth-helpers-nextjs";
-import { type NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
+import { createServerClient, type CookieOptions } from '@supabase/ssr';
+import { type NextRequest, NextResponse } from 'next/server';
 
-// Define public paths that should bypass session checks
 const publicPaths = [
-  "/login",
-  "/register",
-  "/", // Root page
-  // Auth related paths
-  "/auth/callback",
-  // API routes for auth or public data
-  // path.startsWith("/api/auth") will be handled separately
+  '/login',
+  '/register',
+  '/', // Root page
+  '/auth/callback',
+  // API routes for auth or public data (e.g., path.startsWith('/api/public'))
+  // Note: path.startsWith('/api/auth') was there, but /auth/callback is more specific
 ];
 
-export async function middleware(req: NextRequest) {
-  const path = req.nextUrl.pathname;
+export async function middleware(request: NextRequest) {
+  const path = request.nextUrl.pathname;
+
+  // Create an outgoing response object that can be modified
+  // Clone request headers to ensure they are passed through
+  let response = NextResponse.next({
+    request: {
+      headers: request.headers,
+    },
+  });
 
   // Check if the current path is one of the public paths
   // or if it's for Next.js internals that should always be allowed.
-  // The matcher already excludes _next/static, _next/image, favicon.ico, and /public.
-  if (publicPaths.includes(path) || path.startsWith("/api/auth")) {
-    return NextResponse.next();
+  if (publicPaths.includes(path) || path.startsWith('/api/auth')) {
+    // For /api/auth routes, we might still want to initialize Supabase
+    // if they need to interact with auth state (e.g. user())
+    // but for now, let's assume they are for things like login/logout handlers
+    // that don't need a pre-existing session check here.
+    return response; // Use the prepared response
   }
 
-  try {
-    const cookieStore = cookies();
-    // Ensure NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY are set in environment
-    const supabase = createRouteHandlerClient({ cookies: () => cookieStore });
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        get(name: string) {
+          return request.cookies.get(name)?.value;
+        },
+        set(name: string, value: string, options: CookieOptions) {
+          // If the cookie is set, update the request and response cookies
+          request.cookies.set({ name, value, ...options });
+          response.cookies.set({ name, value, ...options });
+        },
+        remove(name: string, options: CookieOptions) {
+          // If the cookie is removed, update the request and response cookies
+          request.cookies.set({ name, value: '', ...options });
+          response.cookies.set({ name, value: '', ...options });
+        },
+      },
+    }
+  );
 
+  try {
     const { data: { session }, error: sessionError } = await supabase.auth.getSession();
 
     if (sessionError) {
-      console.error("Error getting session in middleware:", sessionError.message);
-      // Decide if to redirect to login or allow access if session check fails critically
-      // For now, redirect to login for security.
-      const redirectUrl = req.nextUrl.clone();
-      redirectUrl.pathname = "/login";
-      redirectUrl.search = "";
+      console.error('Error getting session in middleware:', sessionError.message);
+      // Potentially redirect to an error page or login
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = '/login';
+      redirectUrl.search = '';
       return NextResponse.redirect(redirectUrl);
     }
 
     if (!session) {
-      const redirectUrl = req.nextUrl.clone();
-      redirectUrl.pathname = "/login";
-      redirectUrl.search = ""; // Clear search params to avoid loops
+      const redirectUrl = request.nextUrl.clone();
+      redirectUrl.pathname = '/login';
+      redirectUrl.search = ''; // Clear search params
       return NextResponse.redirect(redirectUrl);
     }
 
-    // If there is a session, allow the request to proceed.
-    // The response object needs to be passed through to allow Supabase helpers to set cookies if needed.
-    const res = NextResponse.next();
-    return res;
+    // Session exists, allow the request to proceed with the (potentially modified) response
+    return response;
 
   } catch (error) {
-    // Catch any other unexpected errors during middleware execution
-    console.error("Unexpected middleware error on path:", path, error);
-    const errorRedirectUrl = req.nextUrl.clone();
-    errorRedirectUrl.pathname = "/login";
-    errorRedirectUrl.search = "";
+    console.error('Unexpected middleware error on path:', path, error);
+    const errorRedirectUrl = request.nextUrl.clone();
+    errorRedirectUrl.pathname = '/login'; // Or a generic error page
+    errorRedirectUrl.search = '';
     return NextResponse.redirect(errorRedirectUrl);
   }
 }
@@ -71,6 +93,6 @@ export const config = {
      * - favicon.ico (favicon file)
      * - public (directory) - This excludes all files in the /public folder
      */
-    "/((?!_next/static|_next/image|favicon.ico|public/).*)",
+    '/((?!_next/static|_next/image|favicon.ico|public/).*)',
   ],
 };

@@ -14,47 +14,50 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { ColorPaletteSelector } from "@/components/color-palette-selector";
 import { useAuth } from "@/components/auth-provider";
 import { useToast } from "@/hooks/use-toast";
-import { createClientComponentClient } from "@supabase/auth-helpers-nextjs";
+// import { createClientComponentClient } from "@supabase/auth-helpers-nextjs"; // Removed
 
 export default function SettingsPage() {
-  const { user, isLoading: isAuthLoading } = useAuth(); // Use isAuthLoading to prevent premature state setting
+  const { user, supabaseClient, loading: authLoading, isConfigured } = useAuth(); // Use supabaseClient from useAuth
   const { toast } = useToast();
-  const supabase = createClientComponentClient();
+  // const supabase = createClientComponentClient(); // Removed
 
   const [displayName, setDisplayName] = useState("");
-  const [initialDisplayName, setInitialDisplayName] = useState(""); // To store initial name for cancel
+  const [initialDisplayName, setInitialDisplayName] = useState("");
   const [userEmail, setUserEmail] = useState("");
   const [isSaving, setIsSaving] = useState(false);
-  const [isPageLoading, setIsPageLoading] = useState(true);
+  // isPageLoading can be mostly replaced by authLoading and isConfigured checks
+  // but we might still want a distinct page loading state if there are other async ops for settings page itself.
+  // For now, let's rely on authLoading primarily.
 
   useEffect(() => {
-    if (user) {
+    if (!authLoading && user) {
       const currentFullName = user.user_metadata?.full_name || user.user_metadata?.name || "";
       setDisplayName(currentFullName);
-      setInitialDisplayName(currentFullName); // Store initial name
+      setInitialDisplayName(currentFullName);
       setUserEmail(user.email || "");
-      setIsPageLoading(false);
-    } else if (!isAuthLoading) {
-      // If auth is not loading and user is null, means user is not logged in or data not available
-      setIsPageLoading(false);
-      // Optionally redirect or show message if user is null and not loading
     }
-  }, [user, isAuthLoading]);
+    // If !authLoading and !user, it means user is not logged in, AuthProvider should handle redirects.
+  }, [user, authLoading]);
 
   const getAuthToken = async () => {
-    const session = await supabase.auth.getSession();
-    if (session.error) {
-      toast({ title: "Authentication Error", description: session.error.message, variant: "destructive" });
+    if (!supabaseClient) return null; // Check supabaseClient
+    const { data: { session }, error } = await supabaseClient.auth.getSession(); // Use supabaseClient
+    if (error) {
+      toast({ title: "Authentication Error", description: error.message, variant: "destructive" });
       return null;
     }
-    return session.data.session?.access_token;
+    return session?.access_token;
   };
 
   const handleSaveChanges = async () => {
+    if (!supabaseClient || !isConfigured) { // Check supabaseClient and configuration
+      toast({ title: "Error", description: "Supabase client not available or not configured.", variant: "destructive" });
+      return;
+    }
     setIsSaving(true);
     const token = await getAuthToken();
     if (!token) {
-      toast({ title: "Authentication Error", description: "Not authenticated.", variant: "destructive" });
+      // getAuthToken already shows a toast for auth errors
       setIsSaving(false);
       return;
     }
@@ -76,13 +79,10 @@ export default function SettingsPage() {
       }
 
       toast({ title: "Success", description: "Profile updated successfully." });
-      setInitialDisplayName(displayName); // Update initial name to current saved name
+      setInitialDisplayName(displayName);
 
-      // Refresh Supabase session to get updated user metadata if AuthProvider doesn't auto-update
-      // This can trigger onAuthStateChange in AuthProvider if setup for USER_UPDATED event
-      await supabase.auth.refreshSession();
-      // Supabase client in useAuth should pick up changes via onAuthStateChange listener.
-      // If not, a manual re-fetch or prop update to AuthProvider might be needed, but usually refreshSession is enough.
+      // Refresh Supabase session to get updated user metadata
+      await supabaseClient.auth.refreshSession(); // Use supabaseClient
 
     } catch (error: any) {
       toast({ title: "Error", description: error.message, variant: "destructive" });
@@ -92,7 +92,7 @@ export default function SettingsPage() {
   };
 
   const handleCancelChanges = () => {
-    setDisplayName(initialDisplayName); // Revert to initial name
+    setDisplayName(initialDisplayName);
   };
 
   const handleClearCache = () => {
@@ -102,7 +102,8 @@ export default function SettingsPage() {
     });
   };
 
-  if (isPageLoading) {
+  // Display loading state while auth is being resolved or if Supabase is not yet configured
+  if (authLoading) {
     return (
       <SidebarInset className="bg-dark-bg flex flex-col h-screen">
         <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
@@ -121,8 +122,44 @@ export default function SettingsPage() {
     );
   }
 
+  if (!isConfigured) {
+     return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Settings className="w-5 h-5 text-gray-400" />
+             <h1 className="text-lg font-semibold text-white">Settings</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center text-white">
+          Supabase is not configured. Please check your environment variables.
+        </div>
+      </SidebarInset>
+    );
+  }
+
+  if (!user && !authLoading) { // Should be handled by ProtectedRoute
+    return (
+      <SidebarInset className="bg-dark-bg flex flex-col h-screen">
+        <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
+           <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
+           <Separator orientation="vertical" className="mr-2 h-4 bg-dark-border" />
+           <div className="flex items-center gap-2">
+             <Settings className="w-5 h-5 text-gray-400" />
+             <h1 className="text-lg font-semibold text-white">Settings</h1>
+           </div>
+        </header>
+        <div className="flex flex-1 items-center justify-center text-white">
+          Redirecting to login...
+        </div>
+      </SidebarInset>
+    );
+  }
+
   return (
-    <SidebarInset className="bg-dark-bg flex flex-col h-screen"> {/* Added flex flex-col h-screen for layout */}
+    <SidebarInset className="bg-dark-bg flex flex-col h-screen">
       {/* Header */}
       <header className="flex h-16 shrink-0 items-center gap-2 border-b border-dark-border bg-dark-card/50 backdrop-blur-sm px-4">
         <SidebarTrigger className="-ml-1 text-white hover:bg-dark-card" />
@@ -134,7 +171,7 @@ export default function SettingsPage() {
       </header>
 
       {/* Main Content */}
-      <div className="flex flex-1 flex-col gap-6 p-6">
+      <div className="flex flex-1 flex-col gap-6 p-6 overflow-y-auto"> {/* Added overflow-y-auto */}
         <Tabs defaultValue="appearance" className="w-full">
           <TabsList className="grid w-full grid-cols-4 bg-dark-card border border-dark-border">
             <TabsTrigger
@@ -359,7 +396,7 @@ export default function SettingsPage() {
                       value={displayName}
                       onChange={(e) => setDisplayName(e.target.value)}
                       className="bg-dark-bg border-dark-border text-white"
-                      disabled={isPageLoading || isSaving}
+                      disabled={authLoading || isSaving || !isConfigured}
                     />
                   </div>
                   <div className="space-y-2">
@@ -368,15 +405,15 @@ export default function SettingsPage() {
                       id="email"
                       value={userEmail}
                       readOnly
-                      className="bg-dark-bg border-dark-border text-gray-400"  // Indicate read-only status
-                      disabled={isPageLoading}
+                      className="bg-dark-bg border-dark-border text-gray-400"
+                      disabled={authLoading || !isConfigured}
                     />
                   </div>
                 </div>
 
                 <div className="space-y-2">
                   <Label className="text-white">Time Zone</Label>
-                  <Select defaultValue="utc">
+                  <Select defaultValue="utc" disabled={authLoading || !isConfigured}>
                     <SelectTrigger className="bg-dark-bg border-dark-border text-white">
                       <SelectValue />
                     </SelectTrigger>
@@ -394,13 +431,13 @@ export default function SettingsPage() {
                     <Label className="text-white">Two-Factor Authentication</Label>
                     <p className="text-sm text-gray-400">Add an extra layer of security</p>
                   </div>
-                  <Switch />
+                  <Switch disabled={authLoading || !isConfigured} />
                 </div>
 
                 <div className="pt-4 border-t border-dark-border flex gap-2">
                   <Button
                     onClick={handleSaveChanges}
-                    disabled={isSaving || isPageLoading || displayName === initialDisplayName}
+                    disabled={isSaving || authLoading || displayName === initialDisplayName || !isConfigured || !supabaseClient}
                     className="bg-neon-purple/20 border border-neon-purple/50 text-neon-purple hover:bg-neon-purple/30"
                   >
                     {isSaving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
@@ -410,7 +447,7 @@ export default function SettingsPage() {
                     variant="outline"
                     className="border-gray-600 text-gray-400"
                     onClick={handleCancelChanges}
-                    disabled={isSaving || isPageLoading}
+                    disabled={isSaving || authLoading || !isConfigured}
                   >
                     Cancel
                   </Button>
