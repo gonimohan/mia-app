@@ -43,6 +43,7 @@ import { useToast } from "@/hooks/use-toast"
 
 import { APIKeyManager } from "@/components/api-key-manager"
 import { RealTimeSync } from "@/components/real-time-sync"
+import { FileUploadManager } from "@/components/file-upload-manager"
 
 interface DataSource {
   id: string;
