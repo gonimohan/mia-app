@@ -568,6 +568,7 @@ export default function DataIntegrationPage() {
                   toast({ title: "Error", description: "Could not find data source to edit.", variant: "destructive" });
                 }
               }}
+              onRefreshData={fetchDataSources}
               isLoadingTest={testingSourceId}
             />
           </TabsContent>
