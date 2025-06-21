@@ -439,7 +439,7 @@ export default function DataIntegrationPage() {
         )}
         {(!isLoading || dataSources.length > 0) && ( // Show tabs if not loading OR if there's data (even if a refresh is loading)
         <Tabs defaultValue="sources" className="w-full">
-          <TabsList className="grid w-full grid-cols-4 bg-dark-card border border-dark-border">
+          <TabsList className="grid w-full grid-cols-5 bg-dark-card border border-dark-border">
             <TabsTrigger
               value="sources"
               className="data-[state=active]:bg-neon-blue/20 data-[state=active]:text-neon-blue data-[state=active]:border-b-2 data-[state=active]:border-neon-blue"
@@ -451,6 +451,12 @@ export default function DataIntegrationPage() {
               className="data-[state=active]:bg-neon-green/20 data-[state=active]:text-neon-green data-[state=active]:border-b-2 data-[state=active]:border-neon-green"
             >
               API Keys
+            </TabsTrigger>
+            <TabsTrigger
+              value="file-upload"
+              className="data-[state=active]:bg-neon-orange/20 data-[state=active]:text-neon-orange data-[state=active]:border-b-2 data-[state=active]:border-neon-orange"
+            >
+              File Upload
             </TabsTrigger>
             <TabsTrigger
               value="real-time"
