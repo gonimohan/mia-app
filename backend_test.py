@@ -19,7 +19,7 @@ class MarketIntelligenceAPITest(unittest.TestCase):
     def setUp(self):
         """Set up test environment before each test"""
         self.api_url = API_BASE_URL
-        self.test_user_email = "test@example.com"
+        self.test_user_email = "test.user@gmail.com"
         self.test_user_password = "Test123!@#"
         self.auth_token = None
         self.test_file_id = None
