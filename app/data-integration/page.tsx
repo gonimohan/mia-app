@@ -580,6 +580,10 @@ export default function DataIntegrationPage() {
             />
           </TabsContent>
 
+          <TabsContent value="file-upload" className="space-y-4">
+            <FileUploadManager />
+          </TabsContent>
+
           <TabsContent value="real-time" className="space-y-4">
             <RealTimeSync />
           </TabsContent>
