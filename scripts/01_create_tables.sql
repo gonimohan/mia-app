@@ -73,9 +73,29 @@ CREATE TABLE IF NOT EXISTS competitors (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Documents table for storing uploaded file information and extracted text
+CREATE TABLE IF NOT EXISTS documents (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    filename VARCHAR(255) NOT NULL, -- Stored filename (e.g., after sanitization or if renamed)
+    original_filename VARCHAR(255) NOT NULL, -- Original name of the uploaded file
+    status VARCHAR(50) DEFAULT 'pending', -- 'pending', 'uploaded', 'processing', 'completed', 'failed'
+    upload_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    processing_time TIMESTAMP WITH TIME ZONE,
+    extracted_text TEXT,
+    file_type VARCHAR(100), -- e.g., 'pdf', 'docx', 'txt'
+    file_size BIGINT, -- Size in bytes
+    error_message TEXT, -- Store any error messages during processing
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Create indexes for better performance
 CREATE INDEX IF NOT EXISTS idx_data_sources_user_id ON data_sources(user_id);
 CREATE INDEX IF NOT EXISTS idx_reports_user_id ON reports(user_id);
 CREATE INDEX IF NOT EXISTS idx_kpi_metrics_user_id ON kpi_metrics(user_id);
 CREATE INDEX IF NOT EXISTS idx_market_trends_user_id ON market_trends(user_id);
 CREATE INDEX IF NOT EXISTS idx_competitors_user_id ON competitors(user_id);
+CREATE INDEX IF NOT EXISTS idx_documents_user_id ON documents(user_id);
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+CREATE INDEX IF NOT EXISTS idx_documents_upload_time ON documents(upload_time);

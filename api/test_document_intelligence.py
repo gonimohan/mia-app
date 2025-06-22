@@ -219,12 +219,12 @@ class TestAPIEndpoints(unittest.TestCase):
 
     @patch('main.BackgroundTasks', MagicMock()) # Mock BackgroundTasks
     @patch('main.get_current_user') # Mock user dependency
-    def test_upload_file_success(self, mock_get_current_user, mock_db_ops, mock_text_processor_ops):
+    def test_upload_file_success(self, mock_get_current_user, mock_text_processor, mock_database): # Corrected mock names
         mock_user = MagicMock()
         mock_user.id = "test_user_123"
         mock_get_current_user.return_value = mock_user
 
-        mock_db_ops.insert_document.return_value = "mock_document_id_123"
+        mock_database.insert_document.return_value = "mock_document_id_123" # Use corrected mock name
 
         # Simulate file upload
         dummy_file_path = create_dummy_file("api_test_upload", "API test content", ".txt")
@@ -241,10 +241,10 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(json_response["document_id"], "mock_document_id_123")
         self.assertEqual(json_response["original_filename"], "api_test_upload.txt")
 
-        mock_db_ops.insert_document.assert_called_once()
-        args, kwargs = mock_db_ops.insert_document.call_args
+        mock_database.insert_document.assert_called_once() # Use corrected mock name
+        args, kwargs = mock_database.insert_document.call_args # Use corrected mock name
         self.assertEqual(args[0]['original_filename'], "api_test_upload.txt")
-        self.assertEqual(args[0]['uploader_id'], "test_user_123")
+        self.assertEqual(args[0]['user_id'], "test_user_123")
         self.assertEqual(args[0]['status'], "uploaded")
 
         # Check that background task was added (by checking if the pipeline was called via mock if not using BackgroundTasks directly)
@@ -254,7 +254,7 @@ class TestAPIEndpoints(unittest.TestCase):
         # We are essentially testing that the endpoint tries to start it.
 
     @patch('main.get_current_user')
-    def test_upload_file_invalid_type(self, mock_get_current_user, mock_db_ops, mock_text_processor_ops):
+    def test_upload_file_invalid_type(self, mock_get_current_user, mock_text_processor, mock_database): # Corrected mock names
         mock_user = MagicMock()
         mock_user.id = "test_user_123"
         mock_get_current_user.return_value = mock_user
@@ -269,10 +269,10 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertIn("Unsupported file type", response.json()["detail"])
 
 
-    def test_generate_report_success(self, mock_db_ops, mock_text_processor_ops):
+    def test_generate_report_success(self, mock_text_processor, mock_database): # Corrected mock names
         mock_doc_id = "analyzed_doc_1"
-        mock_db_ops.get_document_by_id.return_value = {
-            "_id": mock_doc_id,
+        mock_database.get_document_by_id.return_value = { # Use corrected mock name
+            "id": mock_doc_id,
             "original_filename": "report_me.pdf",
             "upload_time": "2023-01-01T10:00:00Z",
             "word_count": 150,
@@ -287,17 +287,17 @@ class TestAPIEndpoints(unittest.TestCase):
         self.assertEqual(json_response["word_count"], 150)
         self.assertTrue(json_response["analysis"]["market trends"])
 
-    def test_generate_report_not_found(self, mock_db_ops, mock_text_processor_ops):
+    def test_generate_report_not_found(self, mock_text_processor, mock_database): # Corrected mock names
         mock_doc_id = "non_existent_doc_1"
-        mock_db_ops.get_document_by_id.return_value = None
+        mock_database.get_document_by_id.return_value = None # Use corrected mock name
         response = client.get(f"/api/agent/generate-report/{mock_doc_id}")
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.json()["detail"], "Document not found.")
 
-    def test_generate_report_not_analyzed(self, mock_db_ops, mock_text_processor_ops):
+    def test_generate_report_not_analyzed(self, mock_text_processor, mock_database): # Corrected mock names
         mock_doc_id = "processing_doc_1"
-        mock_db_ops.get_document_by_id.return_value = {
-            "_id": mock_doc_id,
+        mock_database.get_document_by_id.return_value = { # Use corrected mock name
+            "id": mock_doc_id,
             "original_filename": "processing.pdf",
             "status": "processing" # or "uploaded", "text_extracted"
         }

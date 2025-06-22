@@ -277,14 +277,14 @@ class MarketIntelligenceAgent:
 # Initialize AI agent
 ai_agent = MarketIntelligenceAgent()
 
-# Connect to MongoDB on startup and close on shutdown
-@app.on_event("startup")
-async def startup_db_client():
-    database.connect_to_mongo()
+# MongoDB startup/shutdown events are no longer needed with Supabase client's lazy initialization.
+# @app.on_event("startup")
+# async def startup_db_client():
+#     database.connect_to_mongo() # This function no longer exists
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    database.close_mongo_connection()
+# @app.on_event("shutdown")
+# async def shutdown_db_client():
+#     database.close_mongo_connection() # This function no longer exists
 
 # Global error handler
 @app.exception_handler(Exception)
@@ -529,7 +529,7 @@ async def upload_document_for_intelligence(
         "file_type": file.content_type, # MIME type
         "file_extension": file_extension,
         "file_size": file_size,
-        "uploader_id": uploader_id_str,
+        "user_id": uploader_id_str, # Changed from uploader_id to user_id
         "upload_time": datetime.now().isoformat(),
         "status": "uploaded", # Initial status
         "text": None,
