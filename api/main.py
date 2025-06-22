@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Depends
+from fastapi import FastAPI, HTTPException, Request, File, UploadFile, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -18,6 +18,8 @@ import numpy as np
 from supabase import create_client, Client
 from pathlib import Path
 import json
+from . import database # For MongoDB operations
+from . import text_processor # For text extraction and analysis
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -275,6 +277,15 @@ class MarketIntelligenceAgent:
 # Initialize AI agent
 ai_agent = MarketIntelligenceAgent()
 
+# Connect to MongoDB on startup and close on shutdown
+@app.on_event("startup")
+async def startup_db_client():
+    database.connect_to_mongo()
+
+@app.on_event("shutdown")
+async def shutdown_db_client():
+    database.close_mongo_connection()
+
 # Global error handler
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -409,95 +420,201 @@ async def chat(request: ChatRequest):
         logger.error(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Chat processing failed: {str(e)}")
 
-@app.post("/api/upload")
-async def upload_file(
-    file: UploadFile = File(...),
-    analysis_type: str = "comprehensive",
-    user=Depends(get_current_user)
-):
-    """Upload and process files for market intelligence analysis"""
+async def process_document_pipeline(document_id: str, internal_filename: str, original_filename: str, file_extension: str, saved_file_path: str):
+    """
+    Background task to process a document: extract text, analyze keywords, and update MongoDB.
+    """
+    logger.info(f"Background task started for document_id: {document_id}, file: {original_filename} (path: {saved_file_path})")
     try:
-        # Validate file type
-        allowed_extensions = {'.csv', '.xlsx', '.xls', '.pdf', '.txt', '.md'}
-        file_extension = Path(file.filename).suffix.lower()
-        
-        if file_extension not in allowed_extensions:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Unsupported file type: {file_extension}. Allowed: {', '.join(allowed_extensions)}"
-            )
+        # 1. Update status to processing
+        update_success = database.update_document_by_id(document_id, {"status": "processing"})
+        if not update_success:
+            logger.error(f"Failed to update status to 'processing' for document_id: {document_id}. Aborting pipeline.")
+            return
 
-        # Read file content
-        file_content = await file.read()
-        file_size = len(file_content)
+        # 2. Extract text
+        # Note: extract_text_from_file expects file_extension, not mime_type for routing.
+        extracted_data = text_processor.extract_text_from_file(saved_file_path, file_extension)
         
-        # Check file size (max 10MB)
-        if file_size > 10 * 1024 * 1024:
-            raise HTTPException(status_code=400, detail="File size exceeds 10MB limit")
+        if not extracted_data or extracted_data.get("text") is None: # Check for None explicitly if empty text is valid but count is 0
+            logger.error(f"Text extraction failed or returned empty for document_id: {document_id}")
+            database.update_document_by_id(document_id, {"status": "extraction_failed", "error_message": "Failed to extract text or text is empty."})
+            return
+        
+        extracted_text = extracted_data["text"]
+        word_count = extracted_data["word_count"]
+        
+        update_success = database.update_document_by_id(document_id, {
+            "text": extracted_text,
+            "word_count": word_count,
+            "text_preview": extracted_text[:500], # Ensure preview is based on actual extracted text
+            "status": "text_extracted"
+        })
+        if not update_success:
+            logger.error(f"Failed to update DB after text extraction for document_id: {document_id}.")
+            # Decide if to continue or abort; for now, we'll log and continue to analysis if text was extracted
+        
+        logger.info(f"Text extracted for document_id: {document_id}, word count: {word_count}")
 
-        # Generate unique file ID
-        file_id = str(uuid.uuid4())
-        
-        # Process file based on type
-        file_processor = FileProcessor()
-        processed_data = {}
-        
-        if file_extension == '.csv':
-            processed_data = file_processor.process_csv(file_content)
-        elif file_extension in ['.xlsx', '.xls']:
-            processed_data = file_processor.process_excel(file_content)
-        elif file_extension in ['.txt', '.md']:
-            processed_data = file_processor.process_text(file_content)
-        elif file_extension == '.pdf':
-            processed_data = file_processor.process_pdf(file_content)
-        
-        # Save file to storage
-        file_path = UPLOAD_DIR / f"{file_id}_{file.filename}"
-        with open(file_path, "wb") as f:
-            f.write(file_content)
-        
-        # Store file metadata in database
-        file_record = {
-            "id": file_id,
-            "user_id": user.id,
-            "filename": file.filename,
-            "file_type": file_extension,
-            "file_size": file_size,
-            "file_path": str(file_path),
-            "processing_status": "completed",
-            "processed_data": processed_data,
-            "uploaded_at": datetime.now().isoformat()
-        }
-        
-        if supabase:
-            try:
-                supabase.table("uploaded_files").insert(file_record).execute()
-                logger.info(f"File metadata stored for: {file_id}")
-            except Exception as db_error:
-                logger.warning(f"Failed to store file metadata: {db_error}")
+        # 3. Analyze text (keywords)
+        analysis_results = text_processor.analyze_text_keywords(extracted_text)
+        update_success = database.update_document_by_id(document_id, {
+            "analysis": analysis_results,
+            "status": "analyzed" # Final successful status for this pipeline
+        })
+        if not update_success:
+             logger.error(f"Failed to update DB after text analysis for document_id: {document_id}.")
+             # Status remains 'text_extracted' or whatever previous state was if this fails
 
-        # Generate AI analysis of the file
-        ai_analysis = await ai_agent.process_file_with_ai(processed_data, analysis_type)
-        
-        return {
-            "file_id": file_id,
-            "filename": file.filename,
-            "file_type": file_extension,
-            "file_size": file_size,
-            "processing_status": "completed",
-            "processed_data": processed_data,
-            "ai_analysis": ai_analysis,
-            "upload_timestamp": datetime.now().isoformat()
-        }
-        
-    except HTTPException:
-        raise
+        logger.info(f"Successfully processed and analyzed document_id: {document_id}")
+
     except Exception as e:
-        logger.error(f"File upload error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+        logger.error(f"Error in processing pipeline for document_id {document_id}: {e}\n{traceback.format_exc()}")
+        database.update_document_by_id(document_id, {"status": "processing_failed", "error_message": str(e)})
+
+ALLOWED_EXTENSIONS = {".pdf", ".docx", ".txt", ".csv", ".xlsx"}
+MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+
+@app.post("/api/upload")
+async def upload_document_for_intelligence(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    user=Depends(get_current_user) # Assuming get_current_user provides user object with an id attribute
+):
+    """
+    Uploads a document, stores metadata in MongoDB, and triggers a background task
+    for text extraction and analysis.
+    """
+    original_filename = file.filename
+    file_extension = Path(original_filename).suffix.lower()
+
+    if file_extension not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: '{file_extension}'. Allowed types are: {', '.join(ALLOWED_EXTENSIONS)}"
+        )
+
+    # Read file content to check size and save
+    file_content = await file.read()
+    file_size = len(file_content)
+
+    if file_size > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=413, # Payload Too Large
+            detail=f"File size {file_size / (1024*1024):.2f}MB exceeds limit of {MAX_FILE_SIZE_MB}MB."
+        )
+
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="Cannot upload empty file.")
+
+    # Generate a unique internal filename
+    internal_filename = f"{str(uuid.uuid4())}{file_extension}"
+    saved_file_path = UPLOAD_DIR / internal_filename
+
+    try:
+        with open(saved_file_path, "wb") as f:
+            f.write(file_content)
+    except Exception as e:
+        logger.error(f"Failed to save uploaded file {original_filename} to {saved_file_path}: {e}")
+        raise HTTPException(status_code=500, detail="Could not save uploaded file.")
+
+    uploader_id_str = None
+    if user and hasattr(user, 'id'):
+        uploader_id_str = str(user.id)
+
+    initial_doc_data = {
+        "filename": internal_filename, # Internal unique name
+        "original_filename": original_filename,
+        "file_type": file.content_type, # MIME type
+        "file_extension": file_extension,
+        "file_size": file_size,
+        "uploader_id": uploader_id_str,
+        "upload_time": datetime.now().isoformat(),
+        "status": "uploaded", # Initial status
+        "text": None,
+        "word_count": None,
+        "analysis": None,
+        "text_preview": None,
+        "error_message": None
+    }
+
+    try:
+        document_id = database.insert_document(initial_doc_data)
+        logger.info(f"File '{original_filename}' (ID: {document_id}) metadata stored in MongoDB. Path: {saved_file_path}")
+    except Exception as e:
+        logger.error(f"Failed to insert document metadata into MongoDB for {original_filename}: {e}")
+        # Potentially clean up the saved file if DB insert fails
+        if saved_file_path.exists():
+            saved_file_path.unlink()
+        raise HTTPException(status_code=500, detail="Failed to store document metadata.")
+
+    # Add the processing task to background
+    # background_tasks.add_task(
+    #     process_document_pipeline,
+    #     document_id=document_id,
+    #     internal_filename=internal_filename,
+    #     original_filename=original_filename,
+    #     file_content_type=file.content_type, # This should be file_extension for our text_processor
+    #     saved_file_path=str(saved_file_path)
+    # )
+    background_tasks.add_task(
+        process_document_pipeline,
+        document_id=document_id,
+        internal_filename=internal_filename,
+        original_filename=original_filename,
+        file_extension=file_extension, # Corrected to pass file_extension
+        saved_file_path=str(saved_file_path)
+    )
+    logger.info(f"Background task added for document ID {document_id} to process file {original_filename}")
+
+    return {
+        "message": "File uploaded successfully. Processing started in background.",
+        "document_id": document_id,
+        "original_filename": original_filename,
+        "internal_filename": internal_filename
+    }
+
+@app.get("/api/agent/generate-report/{document_id}")
+async def generate_document_report(document_id: str):
+    """
+    Generates a JSON report for a processed document.
+    """
+    logger.info(f"Report generation request for document_id: {document_id}")
+    doc = database.get_document_by_id(document_id)
+
+    if not doc:
+        logger.warning(f"Report generation: Document not found for ID {document_id}")
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    # Check status - report should only be generated if analysis is complete
+    if doc.get("status") != "analyzed":
+        logger.warning(f"Report generation: Document {document_id} not yet analyzed. Current status: {doc.get('status')}")
+        raise HTTPException(
+            status_code=422, # Unprocessable Entity or 409 Conflict could also work
+            detail=f"Document processing not complete. Current status: {doc.get('status', 'Unknown')}. Please try again later."
+        )
+
+    # Construct the report from the document fields
+    report = {
+        "document_id": document_id, # Good to include the ID in the report
+        "original_filename": doc.get("original_filename"),
+        "upload_time": doc.get("upload_time"),
+        "word_count": doc.get("word_count"),
+        "analysis": doc.get("analysis"),
+        "text_preview": doc.get("text_preview")
+        # Ensure all these fields are actually populated by the pipeline
+    }
+
+    # Filter out None values from report if any field wasn't populated as expected
+    # Though ideally, 'analyzed' status means they should be.
+    report_cleaned = {k: v for k, v in report.items() if v is not None}
+
+    logger.info(f"Report generated successfully for document_id: {document_id}")
+    return report_cleaned
 
 @app.get("/api/files")
-async def list_files(user=Depends(get_current_user)):
+async def list_files(user=Depends(get_current_user)): # This existing endpoint seems to list files from Supabase
     """List all uploaded files for the user"""
     try:
         if not supabase:
