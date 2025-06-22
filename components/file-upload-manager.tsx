@@ -103,7 +103,7 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
     if (!file) return
 
     // Validate file type
-    const allowedTypes = ['.csv', '.xlsx', '.xls', '.pdf', '.txt', '.md']
+    const allowedTypes = ['.pdf', '.docx', '.txt', '.csv', '.xlsx'] // Updated
     const fileExtension = '.' + file.name.split('.').pop()?.toLowerCase()
     
     if (!allowedTypes.includes(fileExtension)) {
@@ -115,11 +115,11 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
       return
     }
 
-    // Validate file size (10MB limit)
-    if (file.size > 10 * 1024 * 1024) {
+    // Validate file size (50MB limit as per backend)
+    if (file.size > 50 * 1024 * 1024) { // Updated to 50MB
       toast({
         title: "File Too Large",
-        description: "Please upload files smaller than 10MB.",
+        description: "Please upload files smaller than 50MB.", // Updated message
         variant: "destructive"
       })
       return
@@ -157,20 +157,27 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
         throw new Error(errorData.detail || `Upload failed: ${response.statusText}`)
       }
 
-      const result = await response.json()
+      const result = await response.json() // Expects { message, document_id, original_filename, internal_filename }
       
       toast({
-        title: "Upload Successful",
-        description: `${file.name} has been processed successfully.`
+        title: "Upload Initiated",
+        description: `${result.original_filename} uploaded. Document ID: ${result.document_id}. Processing in background.`,
+        duration: 5000
       })
+      setLastUploadedDocId(result.document_id); // Store the ID of the last uploaded file
 
-      // Add to uploaded files list
-      setUploadedFiles(prev => [result, ...prev])
+      // The 'result' here is from the /api/upload endpoint.
+      // It's not the full "UploadedFile" structure that the list below expects.
+      // The list is populated by fetchUploadedFiles from /api/files (Supabase).
+      // So, we won't add this partial result to setUploadedFiles directly.
+      // The user will see the file in the list after a "Refresh".
       
-      // Notify parent component
-      if (onFileAnalyzed) {
-        onFileAnalyzed(result)
-      }
+      // If onFileAnalyzed expects the *final* analyzed data, we can't call it here.
+      // If it's just to notify that an upload started, we could pass `result`.
+      // For now, I'll assume onFileAnalyzed is for when analysis is complete, so I won't call it.
+      // if (onFileAnalyzed) {
+      //   onFileAnalyzed(result); // This would need adjustment if `result` structure is different
+      // }
 
     } catch (error: any) {
       console.error("Upload error:", error)
@@ -188,51 +195,64 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: {
+      'application/pdf': ['.pdf'],
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+      'text/plain': ['.txt'],
       'text/csv': ['.csv'],
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
-      'application/vnd.ms-excel': ['.xls'],
-      'application/pdf': ['.pdf'],
-      'text/plain': ['.txt'],
-      'text/markdown': ['.md']
     },
     multiple: false,
     disabled: uploading
   })
 
-  const getFileIcon = (fileType: string) => {
-    switch (fileType) {
+  // Helper to get file extension for icon mapping
+  const getFileExtensionForIcon = (filenameOrPath: string) => {
+    if (!filenameOrPath) return ''
+    return ('.' + filenameOrPath.split('.').pop()?.toLowerCase()) || ''
+  }
+
+  const getFileIcon = (filenameOrPath: string) => { // Changed to take filename
+    const fileTypeExt = getFileExtensionForIcon(filenameOrPath)
+    switch (fileTypeExt) {
       case '.csv':
         return <Table className="w-5 h-5 text-neon-green" />
       case '.xlsx':
-      case '.xls':
+        // case '.xls': // .xls is not in our allowed list
         return <FileSpreadsheet className="w-5 h-5 text-neon-blue" />
       case '.pdf':
         return <File className="w-5 h-5 text-neon-pink" />
       case '.txt':
-      case '.md':
         return <FileText className="w-5 h-5 text-neon-orange" />
+      case '.docx':
+        return <FileText className="w-5 h-5 text-purple-400" /> // Example color for docx
       default:
         return <File className="w-5 h-5 text-gray-400" />
     }
   }
 
   const getStatusBadge = (status: string) => {
+    // Adding new statuses from our MongoDB pipeline
     switch (status) {
-      case 'completed':
+      case 'completed': // This was from old Supabase logic, maps to 'analyzed' now
+      case 'analyzed': // completed maps to analyzed
         return (
           <Badge className="bg-neon-green/20 text-neon-green border-neon-green/50">
             <CheckCircle className="w-3 h-3 mr-1" />
-            Completed
+            Analyzed
           </Badge>
         )
       case 'processing':
+      case 'uploaded': // Initial state, still processing
+      case 'text_extracted': // Intermediate state, still processing
         return (
           <Badge className="bg-neon-blue/20 text-neon-blue border-neon-blue/50">
             <Loader2 className="w-3 h-3 mr-1 animate-spin" />
-            Processing
+            {status.charAt(0).toUpperCase() + status.slice(1).replace('_', ' ')}
           </Badge>
         )
-      case 'error':
+      case 'error': // Generic error
+      case 'extraction_failed':
+      case 'processing_failed':
         return (
           <Badge className="bg-neon-pink/20 text-neon-pink border-neon-pink/50">
             <AlertCircle className="w-3 h-3 mr-1" />
@@ -307,44 +327,67 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
     }
   }
 
-  const handleGenerateReport = async (fileId: string) => {
+  const handleGenerateReport = async (documentId: string) => { // Changed fileId to documentId
+    if (!documentId) {
+      toast({ title: "Error", description: "Document ID is missing.", variant: "destructive" });
+      return;
+    }
     try {
-      const token = await getAuthToken()
-      if (!token) return
-
-      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/api/files/${fileId}/analyze`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`
-        },
-        body: JSON.stringify({
-          file_id: fileId,
-          analysis_type: 'comprehensive'
-        })
-      })
-
-      if (!response.ok) {
-        throw new Error('Failed to generate report')
+      const token = await getAuthToken() // Assuming this is still needed if the endpoint is protected
+      if (!token && process.env.NODE_ENV !== 'development') { // Allow no token in dev if unprotected
+         toast({ title: "Authentication Error", description: "Cannot generate report.", variant: "destructive" });
+         return;
       }
 
-      const result = await response.json()
+      const headers: HeadersInit = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+
+      const response = await fetch(`${process.env.NEXT_PUBLIC_PYTHON_AGENT_API_BASE_URL}/api/agent/generate-report/${documentId}`, {
+        method: 'GET', // Changed to GET
+        headers: headers
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: "Failed to retrieve report details." }));
+        throw new Error(errorData.detail || `Failed to generate report: ${response.statusText}`);
+      }
+
+      const reportData = await response.json();
       
+      // Display the report in a more structured way (e.g., modal or new section)
+      // For now, using a toast with stringified JSON for simplicity
       toast({
-        title: "Report Generated",
-        description: "Analysis report has been generated successfully.",
-      })
+        title: `Report for ${reportData.original_filename || documentId}`,
+        description: (
+          <pre className="mt-2 w-[340px] rounded-md bg-slate-950 p-4 overflow-x-auto">
+            <code className="text-white">{JSON.stringify(reportData, null, 2)}</code>
+          </pre>
+        ),
+        duration: 10000 // Keep toast longer for viewing data
+      });
       
-      // Refresh file list to get updated analysis
-      fetchUploadedFiles()
+      // No need to refreshUploadedFiles here as this fetches a specific report, not updating the list item's state directly
     } catch (error: any) {
+      console.error("Report generation error:", error);
       toast({
-        title: "Error",
-        description: "Failed to generate report.",
+        title: "Report Generation Failed",
+        description: error.message || "Could not generate report.",
         variant: "destructive"
-      })
+      });
     }
   }
+
+  // Keep track of the last uploaded document ID to offer generating its report
+  const [lastUploadedDocId, setLastUploadedDocId] = useState<string | null>(null);
+  // Update onDrop to set this
+  // ... in onDrop success block:
+  // setLastUploadedDocId(result.document_id); // This will be added in the onDrop success part
+
+  // And the text for the dropzone message:
+  const dropzoneMessage = "Supports PDF, DOCX, TXT, CSV, XLSX (max 50MB)";
+
 
   // Load files on component mount
   React.useEffect(() => {
@@ -394,7 +437,7 @@ export function FileUploadManager({ onFileAnalyzed }: FileUploadManagerProps) {
                     {isDragActive ? 'Drop your file here' : 'Drag & drop a file here, or click to select'}
                   </p>
                   <p className="text-sm text-gray-400">
-                    Supports CSV, Excel (.xlsx, .xls), PDF, and text files (max 10MB)
+                    {dropzoneMessage}
                   </p>
                 </div>
                 <Button
